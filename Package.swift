@@ -3,7 +3,6 @@
 
 import PackageDescription
 
-
 let package = Package(
     name: "VLCKit",
     products: [
@@ -18,7 +17,8 @@ let package = Package(
     ],
     targets: [
         .binaryTarget(name: "VLCKit",
-                      url: "https://download.videolan.org/cocoapods/unstable/VLCKit-4.0.0a16-95efb67d-8e3d17c89.tar.xz",
-                      checksum: "e26c8b1bb65c3cd413a2b3911687e28092da05edb09244303b5da63dbee4bd20"),
+                      url: "https://doloto.alohabrowser.com/repository/maven-releases/com/alohamobile/vlckit-ios/4.0.0-a16/vlckit-ios-4.0.0-a16-vlckit-ios.zip",
+                      checksum: "31a72756f74bd9fee2fbea170eeb3d4458cfd3bda1271ad1a832eae8036b028a"),
     ]
 )
+
