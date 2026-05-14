@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VLCKit Aloha Release <devnull@alohabrowser.com>
+Date: Thu, 14 May 2026 00:00:00 +0000
+Subject: [PATCH 14/14] apple/build.conf: disable rav1e on iOS
+
+rav1e is a Rust-based AV1 encoder. iOS VLCKit is a playback engine — it
+decodes AV1 via dav1d, never encodes — so rav1e is dead weight here.
+
+Building rav1e pulls in cargo-c, which in turn compiles the `time` crate
+from source. On both nightly and current stable Rust the bundled cargo-c
+version chokes with E0282 (type annotations needed for Box<_>), breaking
+the entire contrib build mid-way. Dropping rav1e from the contrib graph
+sidesteps the toolchain incompatibility entirely.
+---
+ extras/package/apple/build.conf | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/extras/package/apple/build.conf b/extras/package/apple/build.conf
+index 0000000..1111111 100644
+--- a/extras/package/apple/build.conf
++++ b/extras/package/apple/build.conf
+@@ -90,6 +90,7 @@ export VLC_CONTRIB_OPTIONS_MACOSX=(
+ # Additional contrib bootstrap options for iOS
+ export VLC_CONTRIB_OPTIONS_IOS=(
+     --disable-aom
++    --disable-rav1e
+ )
+
+ # Additional contrib bootstrap options for tvOS
+--
+2.39.0
+

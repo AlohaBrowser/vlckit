@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VLCKit Aloha Release <devnull@alohabrowser.com>
+Date: Thu, 14 May 2026 00:00:00 +0000
+Subject: [PATCH 13/13] apple/build.sh: neutralise _LIBCPP_ENABLE_ASSERTIONS for
+ Xcode 26+
+
+Xcode 26's libc++ removed _LIBCPP_ENABLE_ASSERTIONS (replaced by
+_LIBCPP_HARDENING_MODE) and turns any `#define _LIBCPP_ENABLE_ASSERTIONS`
+into a hard #error. A few contrib meson subprojects (harfbuzz->ragel-6.10,
+libplacebo) still hardcode -D_LIBCPP_ENABLE_ASSERTIONS=1, so contrib
+compilation aborts immediately.
+
+Append `-U_LIBCPP_ENABLE_ASSERTIONS -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE`
+to the flags written into contrib config.mak so they propagate to every
+meson/cmake project the contrib build runs. The -U comes AFTER any
+hardcoded -D in the project's own meson.build, neutralising it.
+---
+ extras/package/apple/build.sh | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/extras/package/apple/build.sh b/extras/package/apple/build.sh
+index 0000000..1111111 100755
+--- a/extras/package/apple/build.sh
++++ b/extras/package/apple/build.sh
+@@ -690,7 +690,7 @@ mkdir -p "$VLC_CONTRIB_INSTALL_DIR"
+
+ # Write config.mak with flags for the build and compiler overrides
+ # Set flag to error on partial availability
+-write_config_mak "-Werror=partial-availability"
++write_config_mak "-Werror=partial-availability -U_LIBCPP_ENABLE_ASSERTIONS -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE"
+
+ # Write crossfile-meson with flags for the build and compiler overrides
+ write_crossfile_meson
+--
+2.39.0
+
