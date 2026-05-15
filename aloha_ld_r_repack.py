@@ -236,8 +236,27 @@ def run_ld_r(out_dir: str, files: list[str], arch: str, platform: str,
     with open(filelist, "w") as f:
         for name in files:
             f.write(f"./{name}\n")
+    # -keep_private_externs is essential. By default `ld -r` demotes every
+    # `private external` (hidden visibility) symbol in the inputs to a
+    # plain `local`/`non-external` symbol in the output. That kills the
+    # archive: VLCKit's ObjC wrapper sources reference `_libvlc_printerr`
+    # and the static module list references every `_vlc_entry__*` plugin
+    # entry, and both are emitted as `private external` because libvlc /
+    # contribs compile with -fvisibility=hidden. After demotion they're
+    # no longer in the archive's symbol table, so xcodebuild's final
+    # linker stage fails with "Undefined symbols ... _libvlc_printerr,
+    # _vlc_entry__codec_avcodec_libavcodec, …".
+    #
+    # With -keep_private_externs, hidden symbols survive `ld -r` as
+    # `private external` — still globally addressable for archive
+    # symbol-table lookup (so the static-module-list and VLCKit ObjC code
+    # can bind to them), still hidden when the resulting object is later
+    # linked into the consumer's dylib (so they don't leak into
+    # CoreFiles.framework's export trie). This is exactly the
+    # visibility-preserving semantics we want.
     cmd = [
         "xcrun", "ld", "-r",
+        "-keep_private_externs",
         "-arch", arch,
         "-platform_version", platform, min_os, max_os,
         "-filelist", filelist,
