@@ -205,6 +205,38 @@ compute_version() {
 #   - xcodebuild -create-xcframework glues the two slices into a static
 #     xcframework consumable via SPM .binaryTarget.
 #
+# Dedupe `.o` members in the static archive that xcodebuild just wrote into
+# the .xcarchive. VLC's per-plugin static libs each carry the same helper
+# .o (vt_utils, libvlc_opengles_la-*, h264_nal, libplacebo_utils, …) and
+# `libtool -static` blindly concatenates without de-duplicating. Untouched,
+# the resulting archive trips `-Wl,-load_hidden` / `-force_load` with
+# hundreds of "duplicate symbol" errors and breaks any consumer-side
+# visibility workaround. After dedup, ranlib regenerates the symbol table.
+dedup_archive_in_xcarchive() {
+    local xcarchive="$1"
+    local label="$2"
+    local bin="$xcarchive/Products/Library/Frameworks/${TARGET_NAME}.framework/${TARGET_NAME}"
+
+    [ -f "$bin" ] || die "Static binary missing in $xcarchive (expected at $bin)"
+
+    local before_members before_dups
+    before_members=$(ar t "$bin" | wc -l | tr -d ' ')
+    before_dups=$(ar t "$bin" | sort | uniq -d | wc -l | tr -d ' ')
+    log Info "  dedup $label: $before_members members, $before_dups duplicate names"
+
+    local tmp="$bin.dedup.tmp"
+    python3 "$ROOT_DIR/Packaging/dedup_static_archive.py" --quiet "$bin" "$tmp"
+    mv "$tmp" "$bin"
+    ranlib "$bin"
+
+    local after_members after_dups
+    after_members=$(ar t "$bin" | wc -l | tr -d ' ')
+    after_dups=$(ar t "$bin" | sort | uniq -d | wc -l | tr -d ' ')
+    log Info "  dedup $label: $after_members members after, $after_dups duplicate names after"
+    [ "$after_dups" -eq 0 ] \
+        || die "Dedup of $label left $after_dups duplicate members in archive."
+}
+
 do_xcodebuild_archive() {
     local sdk="$1"
     local destination="$2"
@@ -296,9 +328,11 @@ build_xcframework() {
 
     log Info "Archiving VLCKit.framework as STATIC (MACH_O_TYPE=staticlib) for arm64 device"
     do_xcodebuild_archive iphoneos          "generic/platform=iOS"           "$DEVICE_ARCHIVE"
+    dedup_archive_in_xcarchive "$DEVICE_ARCHIVE" "ios-arm64"
 
     log Info "Archiving VLCKit.framework as STATIC (MACH_O_TYPE=staticlib) for arm64 simulator"
     do_xcodebuild_archive iphonesimulator   "generic/platform=iOS Simulator" "$SIM_ARCHIVE"
+    dedup_archive_in_xcarchive "$SIM_ARCHIVE" "ios-arm64-simulator"
 
     log Info "Composing static XCFramework (ios-arm64 + ios-arm64-simulator)"
     rm -rf "$XCFRAMEWORK_PATH"
@@ -326,20 +360,51 @@ package_zip() {
     echo "$slices" | sed 's/^/    /'
     for slice in $slices; do
         local bin="$XCFRAMEWORK_PATH/$slice/${TARGET_NAME}.framework/${TARGET_NAME}"
-        if [ -f "$bin" ]; then
-            local archs filetype
-            archs=$(lipo -archs "$bin" 2>/dev/null || echo "?")
-            # `file` reports "current ar archive" for staticlib, "Mach-O ... dynamically linked shared library" for dylib.
-            filetype=$(file -b "$bin" | head -n1)
-            log Info "  $slice → archs: $archs"
-            log Info "    type:  $filetype"
-            if [[ "$archs" == *" "* ]]; then
-                log Warning "  Slice $slice contains multiple architectures ($archs) — not strictly thin."
-            fi
-            if [[ "$filetype" == *"dynamically linked"* || "$filetype" == *"dynamic library"* ]]; then
-                die "Slice $slice is a DYNAMIC library ($filetype) — expected a static archive. Check MACH_O_TYPE=staticlib."
-            fi
+        [ -f "$bin" ] || continue
+
+        local archs filetype
+        archs=$(lipo -archs "$bin" 2>/dev/null || echo "?")
+        # `file` reports "current ar archive" for staticlib, "Mach-O ... dynamically linked shared library" for dylib.
+        filetype=$(file -b "$bin" | head -n1)
+        log Info "  $slice → archs: $archs"
+        log Info "    type:  $filetype"
+
+        if [[ "$archs" == *" "* ]]; then
+            log Warning "  Slice $slice contains multiple architectures ($archs) — not strictly thin."
         fi
+        if [[ "$filetype" == *"dynamically linked"* || "$filetype" == *"dynamic library"* ]]; then
+            die "Slice $slice is a DYNAMIC library ($filetype) — expected a static archive. Check MACH_O_TYPE=staticlib."
+        fi
+
+        # 2026-05-15 spec acceptance: `ar t VLCKit | sort | uniq -d` must be empty.
+        local dup_count
+        dup_count=$(ar t "$bin" | sort | uniq -d | wc -l | tr -d ' ')
+        if [ "$dup_count" -gt 0 ]; then
+            log Error "  $slice has $dup_count duplicate .o members; top offenders:"
+            ar t "$bin" | sort | uniq -c | sort -rn | awk '$1>1' | head -10 | sed 's/^/      /'
+            die "Archive dedup invariant violated for $slice."
+        fi
+        log Info "    ar dedup: 0 duplicate members"
+
+        # 2026-05-15 spec acceptance: no public FFmpeg internals.
+        # Regex matches symbols of the form _av_*, _avcodec_*, _avformat_*,
+        # _avutil_*, _swscale_*, _swresample_*, _avfilter_*, _postproc_*,
+        # _avdevice_* — same shape as VLC's avformat wrappers, so the check
+        # also catches `_avformat_OpenDemux`-style leaks from libvlc itself.
+        local nm_arch="$archs"
+        # If multi-arch (shouldn't be, but just in case), pick the first.
+        nm_arch="${nm_arch%% *}"
+        local ffmpeg_leak
+        ffmpeg_leak=$(nm -arch "$nm_arch" "$bin" 2>/dev/null \
+            | grep -cE " T _(av|avcodec|avformat|avutil|swscale|swresample|avfilter|postproc|avdevice)_" || true)
+        if [ "$ffmpeg_leak" -gt 0 ]; then
+            log Error "  $slice exports $ffmpeg_leak FFmpeg public symbols (must be 0); first 10:"
+            nm -arch "$nm_arch" "$bin" 2>/dev/null \
+                | grep -E " T _(av|avcodec|avformat|avutil|swscale|swresample|avfilter|postproc|avdevice)_" \
+                | head -10 | sed 's/^/      /'
+            die "FFmpeg visibility invariant violated for $slice."
+        fi
+        log Info "    FFmpeg symbols: 0 public"
     done
 
     ZIP_NAME="${ARTIFACT_ID}-${VERSION}-${CLASSIFIER}.zip"

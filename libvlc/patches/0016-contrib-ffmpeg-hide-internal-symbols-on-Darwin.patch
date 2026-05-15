@@ -1,0 +1,46 @@
+From b816f9157ab4094173f11df55829dc6b276a0d6e Mon Sep 17 00:00:00 2001
+From: VLCKit Aloha Release <devnull@alohabrowser.com>
+Date: Fri, 15 May 2026 12:33:32 +0300
+Subject: [PATCH] contrib/ffmpeg: hide internal symbols on Darwin
+
+Pass --extra-cflags=-fvisibility=hidden and --extra-cxxflags=-fvisibility=hidden
+to FFmpeg's ./configure when building under HAVE_DARWIN_OS, so every FFmpeg
+.o is compiled with hidden ELF/Mach-O visibility.
+
+Why: VLCKit ships as a static archive. Consumers (iOS apps) frequently
+link their own FFmpeg.framework dylib for unrelated download/transcode
+pipelines. With FFmpeg internals visible (uppercase T in nm), the
+linker's first-defined-symbol rule binds VLC's avcodec plugin to the
+consumer's FFmpeg, which has a different AVCodecContext layout. The
+mismatch surfaces as EXC_BAD_ACCESS / PC alignment fault on the very
+first decoded video frame.
+
+After this patch:
+    nm -arch arm64 VLCKit | grep -E ' T _(av_|avcodec_|avformat_|avutil_|swscale_|swresample_)'
+should be EMPTY.
+---
+ contrib/src/ffmpeg/rules.mak | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/contrib/src/ffmpeg/rules.mak b/contrib/src/ffmpeg/rules.mak
+index 671ab5e188..7ebc37dab1 100644
+--- a/contrib/src/ffmpeg/rules.mak
++++ b/contrib/src/ffmpeg/rules.mak
+@@ -144,6 +144,14 @@ endif
+ # Darwin
+ ifdef HAVE_DARWIN_OS
+ FFMPEGCONF += --arch=$(ARCH) --target-os=darwin --extra-cflags="$(CFLAGS)"
++# Aloha: hide all FFmpeg internal symbols. VLCKit consumers (e.g. the iOS app)
++# routinely link their own FFmpeg.framework alongside VLCKit's static archive.
++# Without -fvisibility=hidden FFmpeg's av_*/avcodec_*/avformat_*/avutil_*/
++# swresample_*/swscale_*/avfilter_* symbols escape as public `T` in nm output
++# and collide with the consumer's FFmpeg at link time. The on-demand linker
++# binds VLC's avcodec plugin to the WRONG FFmpeg → struct layout mismatch →
++# EXC_BAD_ACCESS on first decoded frame.
++FFMPEGCONF += --extra-cflags="-fvisibility=hidden" --extra-cxxflags="-fvisibility=hidden"
+ FFMPEGCONF += --disable-lzma
+ ifeq ($(ARCH),x86_64)
+ FFMPEGCONF += --cpu=core2
+-- 
+2.44.0
+

@@ -1,0 +1,52 @@
+From da25e6e53926d39bfc9189f0a911bc597008ebd2 Mon Sep 17 00:00:00 2001
+From: VLCKit Aloha Release <devnull@alohabrowser.com>
+Date: Fri, 15 May 2026 12:36:54 +0300
+Subject: [PATCH] apple/build.sh: compile libvlc with -fvisibility=hidden
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add -fvisibility=hidden to the CFLAGS/CXXFLAGS/OBJCFLAGS exported by
+set_host_envvars before libvlc's ./configure. This makes every C function
+inside libvlc's per-plugin static libraries (libavformat_plugin.a,
+libavcodec_plugin.a, …) compile with hidden Mach-O visibility.
+
+Why: the Aloha iOS app links its own FFmpeg.framework next to VLCKit's
+static archive. Without hidden visibility, VLC's avformat wrapper symbols
+(`_avformat_OpenDemux`, `_avformat_CloseDemux`, …) plus FFmpeg's
+re-exported internals all surface as public `T` in nm output, where they
+collide with the consumer's FFmpeg. The 2026-05-15 spec's done-definition
+explicitly requires:
+
+    nm -arch arm64 VLCKit | grep -E ' T _(av|avcodec|avformat|avutil|swscale|swresample|avfilter|postproc|avdevice)_' | wc -l
+    # expected: 0
+
+VLCKit's own ObjC public API (VLCMediaPlayer et al.) is untouched —
+Objective-C class metadata is registered via the runtime, not via the
+ELF/Mach-O export table.
+---
+ extras/package/apple/build.sh | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/extras/package/apple/build.sh b/extras/package/apple/build.sh
+index 8157d10c5d..388c291096 100755
+--- a/extras/package/apple/build.sh
++++ b/extras/package/apple/build.sh
+@@ -747,7 +747,13 @@ echo ""
+ echo "Building VLC for $VLC_HOST_ARCH"
+ 
+ # Set flags for VLC build
+-set_host_envvars "-g"
++#
++# Aloha: -fvisibility=hidden hides every C function compiled into libvlc's
++# static archive (including VLC's own avformat/avcodec module wrappers like
++# `_avformat_OpenDemux`). When VLCKit ships as a static .framework, the
++# consuming app can link a separate FFmpeg.framework without symbol
++# collisions — required by the 2026-05-15 spec's nm acceptance criterion.
++set_host_envvars "-g -fvisibility=hidden"
+ 
+ # Combine settings from config file
+ VLC_CONFIG_OPTIONS=( "${VLC_CONFIG_OPTIONS_BASE[@]}" )
+-- 
+2.44.0
+
