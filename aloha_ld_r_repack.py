@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""
+aloha_ld_r_repack.py — re-pack libvlc-full-static.a so consumer apps that link
+their own FFmpeg.framework don't collide with VLC's bundled FFmpeg internals.
+
+Why this exists:
+  - VLCKit ships a static archive containing libvlc + all enabled plugins +
+    all contribs (incl. an FFmpeg snapshot used by libavcodec_plugin).
+  - VLC plugin .o files (libavcodec_plugin_la-video.o, …) reference
+    `_avcodec_send_packet`, `_av_frame_alloc`, … as Mach-O `(undefined)
+    external` imports.
+  - Consumer apps (Aloha iOS) link Apple ld with both VLCKit.a AND a
+    separate `Modules/FFmpeg/libavcodec.xcframework`. ld resolves VLC's
+    extern undef refs to the consumer's FFmpeg dylib (which loads first
+    in command order) rather than to VLC's bundled FFmpeg static .o
+    members. The two FFmpegs are different versions → AVCodecContext
+    layout mismatch → indirect branch through garbage struct field →
+    EXC_BAD_ACCESS (PC = 0x200000002) on first decoded frame.
+  - -fvisibility=hidden in VLCKit's apple/build.sh + contrib/ffmpeg
+    rules.mak ALREADY makes FFmpeg internal DEFINITIONS hidden (private
+    external). It does NOT make plugin .o REFERENCES private — Mach-O
+    has no "(undefined) private external" encoding, and clang's
+    `-fvisibility` flag is documented to affect definitions only.
+  - The only way to resolve the cross-archive references INTERNALLY is
+    a partial link (`ld -r`) of the whole archive AT PACKAGING TIME.
+    After `ld -r`, plugin refs that previously were `(undefined)
+    external` become `non-external (was a private external)` — bound to
+    VLC's bundled FFmpeg locally and invisible to consumers.
+
+What this script does (run after `libtool -static -o libvlc-full-static.a`):
+  1. Parses the BSD archive byte-by-byte (Python — handles BSD `#1/NN`
+     extended-name members AND `name~N` duplicate-name members which
+     Apple's `ar t` shows as the same name but treats as separate
+     members).
+  2. Extracts every .o member to a temp directory with a UNIQUE filename
+     even when the macOS host filesystem is case-insensitive (APFS).
+     Live555's `Base64.o` (C++ base64Decode) and FFmpeg's `base64.o`
+     (`_av_base64_decode`) would otherwise overwrite each other on disk.
+  3. Excludes a hard-coded set of members that produce duplicate-SYMBOL
+     errors at `ld -r` time (different .o, same symbol — typically
+     libtool generating both a plain and a libfoo_la-prefixed copy of
+     the same source). For each known pair we drop the one that is
+     redundant for the static-link consumer.
+  4. Runs `xcrun ld -r` with all surviving .o files → one big .o where
+     VLC's plugin → FFmpeg / libvlc / contrib references are
+     statically resolved.
+  5. Re-wraps the single .o in a fresh archive via `xcrun ar -rcs`,
+     overwriting the input path.
+
+Usage:
+    aloha_ld_r_repack.py <input-archive> <arch> <platform> <min-os> <max-os>
+
+    <platform> is one of: ios, ios-simulator, tvos, tvos-simulator, macosx,
+                          xros, xros-simulator, watchos, watchos-simulator
+    <arch>     is one of: arm64, x86_64
+    <min-os>, <max-os>: e.g. "16.0", "26.2"
+
+Side effect: rewrites the input archive in place.
+
+Verification post-run:
+    nm -arch <arch> <archive> | grep -cE ' T _(av|avcodec|avformat|avutil|swscale|swresample|avfilter)_'
+    # expected: 0 — every FFmpeg-prefix T symbol should now be either
+    #            non-external (local) or "was a private external" after
+    #            ld -r's symbol-scope collapse.
+
+    nm -arch <arch> -u <archive> | grep -cE '^_(av|avcodec|avformat|avutil)_'
+    # expected: 0 — no plugin .o still has an undef external FFmpeg ref.
+
+Plan ref: CU-86eq9n2ta, docs/superpowers/qa/2026-05-15-vlckit-aloha03-findings.md
+"""
+
+from __future__ import annotations
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+# Members to exclude because another member in the archive provides the same
+# symbol. Picking which side of each duplicate pair to drop was determined
+# empirically (the kept member is the one whose symbols are actually used at
+# runtime; the dropped one is the redundant libtool-generated sibling).
+KNOWN_DUPLICATE_DROPS = {
+    # _vlc_static_modules — keep VLCLibrary.o (also exports the public
+    # ObjC class _OBJC_CLASS_$_VLCLibrary that consumer apps need); drop
+    # the generated module-list .o that only has the symbol table.
+    "static-module-list.o",
+    # _avas_GetPortType / _avas_PrepareFormat / _avas_SetActive —
+    # libtool packages avaudiosession_common.c twice. Keep the
+    # plugin-prefixed copy (libavsamplebuffer_plugin_la-…) which is
+    # what the plugin actually loads; drop the plain one.
+    "avaudiosession_common.o",
+    # _strverscmp — gnulib provides two copies. Keep libtool one.
+    "strverscmp.o",
+    # _clock_gettime — VLC's compat shim duplicates a platform helper.
+    # Keep the plugin-side one.
+    "compat_clock_gettime.c.o",
+    # _MD5Transform/_MD5Update/_MD5Init/_MD5Final — md5.c.o vs md5.c.o~3.
+    # Keep the ~3 version (libvlc-side); drop the plain one.
+    "md5.c.o",
+}
+
+# Members that are not real .o files (BSD ar's symbol index, empty
+# entries, etc.) — silently skip.
+ARCHIVE_METADATA_NAMES = {"__.SYMDEF", "__.SYMDEF SORTED", ""}
+
+
+def parse_bsd_archive(path: str):
+    """Yield (member_index, real_name, data_bytes) for every member."""
+    idx = 0
+    with open(path, "rb") as f:
+        magic = f.read(8)
+        if magic != b"!<arch>\n":
+            raise SystemExit(f"Not a BSD archive: {path!r} (magic={magic!r})")
+        while True:
+            header = f.read(60)
+            if not header or len(header) < 60:
+                return
+            raw_name = header[:16].decode("ascii", errors="replace").rstrip()
+            size_str = header[48:58].decode("ascii").strip()
+            size = int(size_str)
+            if raw_name.startswith("#1/"):
+                # BSD extended name: actual filename in first NN bytes of data
+                namelen = int(raw_name[3:])
+                real_name = (
+                    f.read(namelen).decode("ascii", errors="replace").rstrip("\x00")
+                )
+                data_size = size - namelen
+            else:
+                real_name = raw_name
+                data_size = size
+            data = f.read(data_size)
+            # BSD ar pads to even byte
+            if size % 2 == 1:
+                f.read(1)
+            idx += 1
+            yield idx, real_name, data
+
+
+def extract_members(archive_path: str, out_dir: str) -> list[str]:
+    """
+    Extract every .o member to out_dir. Handle name collisions both at
+    case-sensitive level (`name~2` BSD duplicate suffix) and at
+    case-insensitive level (`Base64.o` vs `base64.o` on APFS).
+
+    Returns the list of filenames written (relative to out_dir).
+    """
+    written: list[str] = []
+    # case-insensitive lookup: lower(basename) → next dedup index
+    seen_ci: dict[str, int] = {}
+
+    name_re = re.compile(r"^(.+\.o)(~\d+)?$")
+
+    for idx, real_name, data in parse_bsd_archive(archive_path):
+        if real_name in ARCHIVE_METADATA_NAMES:
+            continue
+        m = name_re.match(real_name)
+        if not m:
+            # Not a recognized .o name pattern (e.g. some BSD metadata) → skip.
+            continue
+        basename = m.group(1)
+        tilde_suffix = m.group(2) or ""
+
+        if tilde_suffix:
+            # `name~N` BSD duplicate-name member → always gets a unique
+            # disk name; case-sensitivity is moot because the suffix
+            # differentiates the dedup index.
+            stem = basename.rsplit(".o", 1)[0]
+            outname = f"{stem}__dup{tilde_suffix.lstrip('~')}.o"
+        else:
+            ci_key = basename.lower()
+            count = seen_ci.get(ci_key, 0)
+            seen_ci[ci_key] = count + 1
+            if count == 0:
+                outname = basename
+            else:
+                stem = basename.rsplit(".o", 1)[0]
+                outname = f"{stem}__cidup{count}.o"
+
+        if len(data) == 0:
+            continue
+        with open(os.path.join(out_dir, outname), "wb") as g:
+            g.write(data)
+        written.append(outname)
+
+    return written
+
+
+def select_for_relink(filenames: list[str]) -> list[str]:
+    """Filter out the KNOWN_DUPLICATE_DROPS that would cause `ld -r` to
+    fail with "duplicate symbol" errors."""
+    return [n for n in filenames if n not in KNOWN_DUPLICATE_DROPS]
+
+
+def run_ld_r(out_dir: str, files: list[str], arch: str, platform: str,
+             min_os: str, max_os: str, out_o: str) -> None:
+    """Invoke `xcrun ld -r` to produce a single relocatable .o."""
+    # `ld -r` takes a -filelist for many files; build it.
+    filelist = os.path.join(out_dir, "_filelist.txt")
+    with open(filelist, "w") as f:
+        for name in files:
+            f.write(f"./{name}\n")
+    cmd = [
+        "xcrun", "ld", "-r",
+        "-arch", arch,
+        "-platform_version", platform, min_os, max_os,
+        "-filelist", filelist,
+        "-o", out_o,
+    ]
+    res = subprocess.run(cmd, cwd=out_dir, capture_output=True, text=True)
+    if res.returncode != 0:
+        sys.stderr.write("ld -r failed:\n")
+        sys.stderr.write(res.stderr)
+        raise SystemExit(res.returncode)
+    # Surface any warnings on stderr so they're visible in the build log.
+    if res.stderr.strip():
+        sys.stderr.write(res.stderr)
+
+
+def repack_as_archive(combined_o: str, output_a: str) -> None:
+    """Wrap the single .o back into a static archive."""
+    if os.path.exists(output_a):
+        os.remove(output_a)
+    cmd = ["xcrun", "ar", "-rcs", output_a, combined_o]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        sys.stderr.write("ar -rcs failed:\n")
+        sys.stderr.write(res.stderr)
+        raise SystemExit(res.returncode)
+
+
+def main() -> None:
+    if len(sys.argv) != 6:
+        print(__doc__)
+        sys.exit(2)
+    archive = sys.argv[1]
+    arch = sys.argv[2]
+    platform = sys.argv[3]
+    min_os = sys.argv[4]
+    max_os = sys.argv[5]
+
+    if not os.path.isfile(archive):
+        sys.exit(f"Input archive does not exist: {archive}")
+
+    print(f"[aloha_ld_r_repack] arch={arch} platform={platform} target={min_os}-{max_os}")
+    print(f"[aloha_ld_r_repack] input: {archive} ({os.path.getsize(archive)} bytes)")
+
+    tmp = tempfile.mkdtemp(prefix="vlckit-aloha-repack-")
+    try:
+        members = extract_members(archive, tmp)
+        print(f"[aloha_ld_r_repack] extracted {len(members)} .o members")
+
+        survivors = select_for_relink(members)
+        dropped = len(members) - len(survivors)
+        print(f"[aloha_ld_r_repack] dropped {dropped} known-dup .o, "
+              f"{len(survivors)} go into ld -r")
+
+        combined_o = os.path.join(tmp, "vlckit-combined.o")
+        run_ld_r(tmp, survivors, arch, platform, min_os, max_os, combined_o)
+        print(f"[aloha_ld_r_repack] combined .o: {os.path.getsize(combined_o)} bytes")
+
+        repack_as_archive(combined_o, archive)
+        print(f"[aloha_ld_r_repack] repacked archive: "
+              f"{os.path.getsize(archive)} bytes — overwrote in place")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()

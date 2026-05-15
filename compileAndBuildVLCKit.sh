@@ -221,6 +221,69 @@ buildLibVLC() {
     spopd # builddir
 
     info "Finished compiling libvlc for ${ARCH} with SDK version ${SDK_VERSION}, platform ${PLATFORM}"
+
+    # Aloha: partial-link the per-arch static archive so VLC plugin .o
+    # references to bundled FFmpeg internals (_avcodec_send_packet,
+    # _av_frame_alloc, …) bind to VLC's own hidden copies INSIDE this
+    # archive instead of escaping as Mach-O `(undefined) external` imports
+    # that would later collide with a consumer app's separately-linked
+    # FFmpeg.framework. See aloha_ld_r_repack.py header and
+    # docs/superpowers/qa/2026-05-15-vlckit-aloha03-findings.md for the
+    # full diagnostic. Without this step, -fvisibility=hidden on FFmpeg /
+    # libvlc is not sufficient — clang's visibility flag affects
+    # definitions but not undef external references, so the cross-archive
+    # bind has to be resolved at packaging time via `ld -r`.
+    relink_libvlc_static_arch "${BUILDDIR}" "${ACTUAL_ARCH}" "${PLATFORM}"
+}
+
+# Aloha: partial-link helper. Invokes aloha_ld_r_repack.py against the
+# per-arch libvlc-full-static.a produced by `extras/package/apple/build.sh`.
+relink_libvlc_static_arch() {
+    local BUILDDIR="$1"
+    local ARCH="$2"
+    local PLATFORM="$3"
+    local STATIC_LIB="${BUILDDIR}/static-lib/libvlc-full-static.a"
+
+    if [ ! -f "${STATIC_LIB}" ]; then
+        info "[aloha-repack] skipping: ${STATIC_LIB} not present"
+        return 0
+    fi
+
+    # Map the script's platform name into ld's -platform_version vocabulary.
+    local LD_PLATFORM
+    case "${PLATFORM}" in
+        iphoneos)             LD_PLATFORM="ios" ;;
+        iphonesimulator)      LD_PLATFORM="ios-simulator" ;;
+        appletvos)            LD_PLATFORM="tvos" ;;
+        appletvsimulator)     LD_PLATFORM="tvos-simulator" ;;
+        macosx)               LD_PLATFORM="macos" ;;
+        xros)                 LD_PLATFORM="xros" ;;
+        xrsimulator)          LD_PLATFORM="xros-simulator" ;;
+        watchos)              LD_PLATFORM="watchos" ;;
+        watchsimulator)       LD_PLATFORM="watchos-simulator" ;;
+        *)                    LD_PLATFORM="ios" ;;
+    esac
+
+    # Min OS: VLCKit's deployment baseline is iOS 9 / macOS 10.11 historically
+    # but apple/build.sh's set_host_envvars uses the actual SDK target. We
+    # pass the SDK's deployment target as max-os; min-os just needs to be
+    # <= max-os and >= what the .o files were built for. The compiled .o
+    # files inside the archive carry their own platform_version load
+    # command from compile time; ld -r preserves the most-restrictive.
+    local MIN_OS="9.0"
+    local MAX_OS="${SDK_VERSION}"
+
+    info "[aloha-repack] arch=${ARCH} platform=${LD_PLATFORM} target=${MIN_OS}-${MAX_OS}"
+    python3 "${ROOT_DIR}/aloha_ld_r_repack.py" \
+        "${STATIC_LIB}" \
+        "${ARCH}" \
+        "${LD_PLATFORM}" \
+        "${MIN_OS}" \
+        "${MAX_OS}" || {
+            info "[aloha-repack] FAILED for ${STATIC_LIB}"
+            exit 1
+        }
+    info "[aloha-repack] done — ${STATIC_LIB}"
 }
 
 buildMobileKit() {
