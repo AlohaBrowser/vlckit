@@ -99,6 +99,18 @@ KNOWN_DUPLICATE_DROPS = {
     # _MD5Transform/_MD5Update/_MD5Init/_MD5Final — md5.c.o vs md5.c.o~3.
     # Keep the ~3 version (libvlc-side); drop the plain one.
     "md5.c.o",
+    # _MD5_Init / _MD5_Final / _MD5_Update — collision between libdsm's
+    # bundled MD5 (contrib_mdx_md5.c.o) and libvlc's md5 (md5.c__cidup3.o).
+    # Drop libdsm's copy; libvlc's MD5 is what plugins actually call.
+    "contrib_mdx_md5.c.o",
+    # _psz_vlc_changeset — revision string baked into libvlc and libvlccore
+    # by libtool from the same source. Drop libvlccore_la's copy; libvlc_la's
+    # is the canonical version VLCLibrary surfaces to consumers.
+    "libvlccore_la-revision.o",
+    # _ff_init_half2float_tables — FFmpeg's half-float lookup-table init,
+    # built twice (libavcodec + libswscale) with non-byte-identical
+    # variants. Drop the second copy; it's the same function.
+    "half2float__cidup1.o",
 }
 
 # Members that are not real .o files (BSD ar's symbol index, empty
@@ -144,11 +156,24 @@ def extract_members(archive_path: str, out_dir: str) -> list[str]:
     case-sensitive level (`name~2` BSD duplicate suffix) and at
     case-insensitive level (`Base64.o` vs `base64.o` on APFS).
 
+    Before writing to disk, deduplicate by SHA256 of member content —
+    libtool -static concatenates contrib .a files blindly, so the same
+    translation unit (e.g. protobuf's arena.cc.o, glslang's doc.cpp.o)
+    appears multiple times byte-for-byte when several contribs each
+    bundle a copy. Keeping all of them blows up `ld -r` with thousands
+    of "duplicate symbol" errors. Byte-identical members carry the same
+    symbols, so dropping all but one is always safe.
+
     Returns the list of filenames written (relative to out_dir).
     """
+    import hashlib
+
     written: list[str] = []
     # case-insensitive lookup: lower(basename) → next dedup index
     seen_ci: dict[str, int] = {}
+    # content-hash dedup: sha256(data) → first written filename
+    seen_content: dict[bytes, str] = {}
+    content_dups = 0
 
     name_re = re.compile(r"^(.+\.o)(~\d+)?$")
 
@@ -159,6 +184,14 @@ def extract_members(archive_path: str, out_dir: str) -> list[str]:
         if not m:
             # Not a recognized .o name pattern (e.g. some BSD metadata) → skip.
             continue
+        if len(data) == 0:
+            continue
+
+        content_hash = hashlib.sha256(data).digest()
+        if content_hash in seen_content:
+            content_dups += 1
+            continue
+
         basename = m.group(1)
         tilde_suffix = m.group(2) or ""
 
@@ -178,11 +211,13 @@ def extract_members(archive_path: str, out_dir: str) -> list[str]:
                 stem = basename.rsplit(".o", 1)[0]
                 outname = f"{stem}__cidup{count}.o"
 
-        if len(data) == 0:
-            continue
         with open(os.path.join(out_dir, outname), "wb") as g:
             g.write(data)
         written.append(outname)
+        seen_content[content_hash] = outname
+
+    if content_dups:
+        print(f"[aloha_ld_r_repack] dropped {content_dups} byte-identical duplicate members during extraction")
 
     return written
 
