@@ -77,6 +77,32 @@ import subprocess
 import sys
 import tempfile
 
+# Regex matching FFmpeg-prefix symbols. Used to identify which .o files
+# carry FFmpeg internals (either as definitions or as references). Only
+# those .o get merged via `ld -r`; everything else stays as a separate
+# archive member.
+#
+# CRITICAL: a broad `ld -r` of the entire archive (initial version of
+# this script) breaks C++ RTTI / weak-coalesced symbols in unrelated
+# contribs — most visibly protobuf typeinfo. Apps using those at dyld
+# initialization time crash with `CODESIGNING / Invalid Page` because
+# `ld -r`'s relocation / chained-fixup output is not page-hash-compatible
+# with the consumer dylib link step. Restricting the merge to FFmpeg-
+# related .o files only is the empirical fix.
+FFMPEG_SYMBOL_RE = re.compile(
+    rb"_(av|avcodec|avformat|avutil|swscale|swresample|avfilter|postproc|avdevice)_"
+)
+
+# Filenames that are obviously VLC's FFmpeg plugin wrappers. These reference
+# FFmpeg API even when they don't define any `_av_*` symbol themselves, so
+# we want them in the merged set so their cross-archive references resolve
+# locally. Matched against the .o member name AFTER stripping any libtool
+# `_la-` segment.
+FFMPEG_PLUGIN_NAME_RE = re.compile(
+    r"^(libav[a-z]*_plugin_la-|libpostproc_plugin_la-|libavcodec_common_la-|"
+    r"libswscale_plugin_la-|libswresample_plugin_la-)"
+)
+
 # Members to exclude because another member in the archive provides the same
 # symbol. Picking which side of each duplicate pair to drop was determined
 # empirically (the kept member is the one whose symbols are actually used at
@@ -222,10 +248,57 @@ def extract_members(archive_path: str, out_dir: str) -> list[str]:
     return written
 
 
-def select_for_relink(filenames: list[str]) -> list[str]:
-    """Filter out the KNOWN_DUPLICATE_DROPS that would cause `ld -r` to
-    fail with "duplicate symbol" errors."""
-    return [n for n in filenames if n not in KNOWN_DUPLICATE_DROPS]
+def is_ffmpeg_related(out_dir: str, filename: str) -> bool:
+    """
+    Return True if this .o either defines OR references at least one
+    FFmpeg-prefix symbol, OR if its filename matches a VLC FFmpeg-plugin
+    wrapper pattern. These are the only .o files we want to merge via
+    `ld -r` — merging anything else can corrupt C++ RTTI / weak-coalesced
+    symbols in protobuf, harfbuzz, libplacebo etc.
+
+    Implementation: scan the .o for the FFmpeg symbol prefix in its
+    symbol table. Doing this in pure Python (parsing Mach-O directly)
+    is overkill; we just run `xcrun nm` and grep.
+    """
+    if FFMPEG_PLUGIN_NAME_RE.match(filename):
+        return True
+    path = os.path.join(out_dir, filename)
+    try:
+        # `nm -j` outputs just symbol names (no addresses or types),
+        # one per line. Faster than parsing full nm output. Captures
+        # both defined symbols (T/D/B) and undefined refs (U).
+        out = subprocess.run(
+            ["xcrun", "nm", "-j", path],
+            capture_output=True, check=True,
+        ).stdout
+        return bool(FFMPEG_SYMBOL_RE.search(out))
+    except subprocess.CalledProcessError:
+        return False
+
+
+def select_for_relink(out_dir: str, filenames: list[str]) -> tuple[list[str], list[str]]:
+    """
+    Partition extracted .o filenames into:
+      * to_merge — FFmpeg-related .o files that go into `ld -r`
+      * to_keep  — everything else; stays as separate archive members
+
+    Also drops members in KNOWN_DUPLICATE_DROPS from both sets — those
+    cause duplicate-symbol errors at `ld -r` time when paired with
+    their libtool-prefixed siblings.
+    """
+    to_merge = []
+    to_keep = []
+    for n in filenames:
+        if n in KNOWN_DUPLICATE_DROPS:
+            # Skip entirely — the surviving member of each duplicate pair
+            # is already in either to_merge or to_keep (we keep the
+            # plugin-prefixed sibling).
+            continue
+        if is_ffmpeg_related(out_dir, n):
+            to_merge.append(n)
+        else:
+            to_keep.append(n)
+    return to_merge, to_keep
 
 
 def run_ld_r(out_dir: str, files: list[str], arch: str, platform: str,
@@ -272,14 +345,39 @@ def run_ld_r(out_dir: str, files: list[str], arch: str, platform: str,
         sys.stderr.write(res.stderr)
 
 
-def repack_as_archive(combined_o: str, output_a: str) -> None:
-    """Wrap the single .o back into a static archive."""
+def repack_as_archive(out_dir: str, output_a: str,
+                      combined_o: str, kept_files: list[str]) -> None:
+    """
+    Wrap the merged FFmpeg .o plus all the untouched .o members back into
+    a single static archive via `xcrun libtool -static`.
+
+    Using `libtool -static` (not plain `ar -rcs` on one giant .o) so that
+    each preserved .o keeps its own Mach-O headers, relocations,
+    weak/coalesced attributes, and codedirectory-friendly section
+    layout. This is critical for C++ contribs (protobuf, harfbuzz,
+    libplacebo) whose RTTI/typeinfo data was getting corrupted by the
+    naive single-.o repack.
+    """
     if os.path.exists(output_a):
         os.remove(output_a)
-    cmd = ["xcrun", "ar", "-rcs", output_a, combined_o]
+
+    # Write a libtool filelist: one path per line, combined.o first then
+    # all the kept .o members.
+    filelist = os.path.join(out_dir, "_libtool_filelist.txt")
+    with open(filelist, "w") as f:
+        f.write(combined_o + "\n")
+        for name in kept_files:
+            f.write(os.path.join(out_dir, name) + "\n")
+
+    cmd = [
+        "xcrun", "libtool", "-static",
+        "-no_warning_for_no_symbols",
+        "-filelist", filelist,
+        "-o", output_a,
+    ]
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0:
-        sys.stderr.write("ar -rcs failed:\n")
+        sys.stderr.write("libtool -static failed:\n")
         sys.stderr.write(res.stderr)
         raise SystemExit(res.returncode)
 
@@ -305,18 +403,20 @@ def main() -> None:
         members = extract_members(archive, tmp)
         print(f"[aloha_ld_r_repack] extracted {len(members)} .o members")
 
-        survivors = select_for_relink(members)
-        dropped = len(members) - len(survivors)
-        print(f"[aloha_ld_r_repack] dropped {dropped} known-dup .o, "
-              f"{len(survivors)} go into ld -r")
+        to_merge, to_keep = select_for_relink(tmp, members)
+        dropped = len(members) - len(to_merge) - len(to_keep)
+        print(f"[aloha_ld_r_repack] dropped {dropped} known-dup .o; "
+              f"merge={len(to_merge)} (FFmpeg-related), "
+              f"keep-as-is={len(to_keep)}")
 
-        combined_o = os.path.join(tmp, "vlckit-combined.o")
-        run_ld_r(tmp, survivors, arch, platform, min_os, max_os, combined_o)
-        print(f"[aloha_ld_r_repack] combined .o: {os.path.getsize(combined_o)} bytes")
+        combined_o = os.path.join(tmp, "vlckit-ffmpeg-merged.o")
+        run_ld_r(tmp, to_merge, arch, platform, min_os, max_os, combined_o)
+        print(f"[aloha_ld_r_repack] ffmpeg-merged .o: {os.path.getsize(combined_o)} bytes")
 
-        repack_as_archive(combined_o, archive)
+        repack_as_archive(tmp, archive, combined_o, to_keep)
         print(f"[aloha_ld_r_repack] repacked archive: "
-              f"{os.path.getsize(archive)} bytes — overwrote in place")
+              f"{os.path.getsize(archive)} bytes — overwrote in place "
+              f"(1 merged .o + {len(to_keep)} kept .o = {1 + len(to_keep)} members)")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
