@@ -287,6 +287,25 @@ build_simulator_libvlc_arm64() {
     [ -f "$static_lib" ] \
         || die "libvlc simulator static lib missing at $static_lib"
 
+    # Aloha: partial-link the sim archive too. The hook in
+    # compileAndBuildVLCKit.sh::buildLibVLC runs aloha_ld_r_repack.py for the
+    # iphoneos arch in Pass 1, but we drive the simulator build manually here
+    # (the upstream script forces PLATFORM=iphoneos when FARCH=aarch64), so we
+    # have to invoke the same repack ourselves to keep the symbol-binding
+    # invariants identical across both slices.
+    if [ -x "$ROOT_DIR/aloha_ld_r_repack.py" ]; then
+        log Info "Running aloha_ld_r_repack.py on simulator libvlc-full-static.a"
+        python3 "$ROOT_DIR/aloha_ld_r_repack.py" \
+            "$static_lib" \
+            arm64 \
+            ios-simulator \
+            12.0 \
+            "$sdk_version" \
+            || die "aloha_ld_r_repack failed for simulator slice"
+    else
+        log Warning "aloha_ld_r_repack.py not found; simulator slice will retain external FFmpeg refs"
+    fi
+
     # Mirror compileAndBuildVLCKit.sh's build_simulator_static_lib for VLCKit.xcodeproj.
     log Info "Patching simulator static lib + module-list header into expected locations"
     mkdir -p "$vlc_root/install-iphone-simulator"
