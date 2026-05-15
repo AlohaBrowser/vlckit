@@ -268,10 +268,15 @@ build_simulator_libvlc_arm64() {
     sdk_version=$(xcrun --sdk iphonesimulator --show-sdk-version)
     local vlc_root="$ROOT_DIR/libvlc/vlc"
     local build_dir="$vlc_root/build-iphonesimulator-arm64"
+    local static_lib="$build_dir/static-lib/libvlc-full-static.a"
 
-    log Info "Building libvlc for arm64 iphonesimulator (SDK $sdk_version)"
-    rm -rf "$build_dir"
-    mkdir -p "$build_dir"
+    if [ -f "$static_lib" ]; then
+        log Info "Simulator libvlc already built at $static_lib — incremental rebuild only"
+    else
+        log Info "Building libvlc for arm64 iphonesimulator (SDK $sdk_version)"
+        rm -rf "$build_dir"
+        mkdir -p "$build_dir"
+    fi
     (
         cd "$build_dir"
         ../extras/package/apple/build.sh \
@@ -279,8 +284,8 @@ build_simulator_libvlc_arm64() {
             --sdk=iphonesimulator${sdk_version} \
             --disable-debug
     )
-    [ -f "$build_dir/static-lib/libvlc-full-static.a" ] \
-        || die "libvlc simulator static lib missing at $build_dir/static-lib/libvlc-full-static.a"
+    [ -f "$static_lib" ] \
+        || die "libvlc simulator static lib missing at $static_lib"
 
     # Mirror compileAndBuildVLCKit.sh's build_simulator_static_lib for VLCKit.xcodeproj.
     log Info "Patching simulator static lib + module-list header into expected locations"
