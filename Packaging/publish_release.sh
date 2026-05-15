@@ -387,24 +387,35 @@ package_zip() {
         log Info "    ar dedup: 0 duplicate members"
 
         # 2026-05-15 spec acceptance: no public FFmpeg internals.
-        # Regex matches symbols of the form _av_*, _avcodec_*, _avformat_*,
-        # _avutil_*, _swscale_*, _swresample_*, _avfilter_*, _postproc_*,
-        # _avdevice_* — same shape as VLC's avformat wrappers, so the check
-        # also catches `_avformat_OpenDemux`-style leaks from libvlc itself.
+        # Implementation note on the verification — plain `nm | grep T` (as
+        # written literally in the spec) does NOT distinguish Mach-O hidden
+        # visibility (`private external`) from default visibility (`external`):
+        # both render as the same uppercase `T`. `-fvisibility=hidden` at
+        # compile time emits `private external`, which is FUNCTIONALLY hidden
+        # (the symbols never escape the consuming dylib's export trie) but
+        # still shows as `T` in plain nm. We therefore use `nm -m`, which
+        # shows the per-symbol scope keyword, and only fail on TRULY
+        # `external` defined-in-text symbols matching the FFmpeg regex.
         local nm_arch="$archs"
-        # If multi-arch (shouldn't be, but just in case), pick the first.
-        nm_arch="${nm_arch%% *}"
+        nm_arch="${nm_arch%% *}"  # single-arch slice; pick first if multi
+        local leak_lines
+        leak_lines=$(nm -arch "$nm_arch" -m "$bin" 2>/dev/null \
+            | grep "__TEXT,__text" \
+            | grep -v "private external" \
+            | grep -E " external _(av|avcodec|avformat|avutil|swscale|swresample|avfilter|postproc|avdevice)_" || true)
         local ffmpeg_leak
-        ffmpeg_leak=$(nm -arch "$nm_arch" "$bin" 2>/dev/null \
+        ffmpeg_leak=$(printf '%s\n' "$leak_lines" | grep -c . || true)
+        # Also count the spec's strict `T` matches for diagnostic context.
+        local strict_count
+        strict_count=$(nm -arch "$nm_arch" "$bin" 2>/dev/null \
             | grep -cE " T _(av|avcodec|avformat|avutil|swscale|swresample|avfilter|postproc|avdevice)_" || true)
+        local hidden_count=$((strict_count - ffmpeg_leak))
         if [ "$ffmpeg_leak" -gt 0 ]; then
-            log Error "  $slice exports $ffmpeg_leak FFmpeg public symbols (must be 0); first 10:"
-            nm -arch "$nm_arch" "$bin" 2>/dev/null \
-                | grep -E " T _(av|avcodec|avformat|avutil|swscale|swresample|avfilter|postproc|avdevice)_" \
-                | head -10 | sed 's/^/      /'
+            log Error "  $slice has $ffmpeg_leak truly-external FFmpeg-namespace symbols (must be 0); first 10:"
+            printf '%s\n' "$leak_lines" | head -10 | sed 's/^/      /'
             die "FFmpeg visibility invariant violated for $slice."
         fi
-        log Info "    FFmpeg symbols: 0 public"
+        log Info "    FFmpeg symbols: 0 external (+ $hidden_count private external — hidden, won't leak)"
     done
 
     ZIP_NAME="${ARTIFACT_ID}-${VERSION}-${CLASSIFIER}.zip"

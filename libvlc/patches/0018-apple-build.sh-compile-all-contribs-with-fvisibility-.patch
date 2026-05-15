@@ -1,0 +1,42 @@
+From d3f401e4e503c4cca4a9782bf9202a3437c41735 Mon Sep 17 00:00:00 2001
+From: VLCKit Aloha Release <devnull@alohabrowser.com>
+Date: Fri, 15 May 2026 12:55:19 +0300
+Subject: [PATCH] apple/build.sh: compile all contribs with -fvisibility=hidden
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Extend the flags passed to write_config_mak so every C-like compile flag
+in contrib config.mak — CFLAGS, CXXFLAGS, OBJCFLAGS — carries
+-fvisibility=hidden. With this in place, every contrib library (FFmpeg,
+libvpx, libdsm, libplacebo, microdns, upnp, mpg123, …) ships its static
+.a with all defined symbols marked `private external` (hidden Mach-O
+visibility), so they cannot leak out of the final dylib that consumes
+the VLCKit static archive.
+
+This subsumes the FFmpeg-specific --extra-cflags=-fvisibility=hidden
+already added in patch 0016 (contrib/ffmpeg: hide internal symbols on
+Darwin) for FFmpeg, but is broader: it also closes the libvpx VP9
+helper symbol leak (`_vp9_free_postproc_buffers`,
+`_vp9_get_mvpred_av_var`) flagged by the 2026-05-15 spec's
+done-definition nm check.
+---
+ extras/package/apple/build.sh | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/extras/package/apple/build.sh b/extras/package/apple/build.sh
+index 388c291096..f0ae5035e2 100755
+--- a/extras/package/apple/build.sh
++++ b/extras/package/apple/build.sh
+@@ -690,7 +690,7 @@ mkdir -p "$VLC_CONTRIB_INSTALL_DIR"
+ 
+ # Write config.mak with flags for the build and compiler overrides
+ # Set flag to error on partial availability
+-write_config_mak "-Werror=partial-availability -U_LIBCPP_ENABLE_ASSERTIONS -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE"
++write_config_mak "-Werror=partial-availability -U_LIBCPP_ENABLE_ASSERTIONS -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE -fvisibility=hidden"
+ 
+ # Write crossfile-meson with flags for the build and compiler overrides
+ write_crossfile_meson
+-- 
+2.44.0
+
