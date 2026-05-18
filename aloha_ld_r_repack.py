@@ -90,8 +90,22 @@ import tempfile
 # with the consumer dylib link step. Restricting the merge to FFmpeg-
 # related .o files only is the empirical fix.
 FFMPEG_SYMBOL_RE = re.compile(
-    rb"_(av|avcodec|avformat|avutil|swscale|swresample|avfilter|postproc|avdevice)_"
+    rb"_(av|avcodec|avformat|avutil|swscale|swresample|swr|avfilter|postproc"
+    rb"|avdevice|ff|avpriv)_"
 )
+# Notes on what each prefix catches:
+#   av_/avcodec_/avformat_/avutil_/swscale_/swresample_/avfilter_/avdevice_/
+#   postproc_  — FFmpeg PUBLIC API symbols
+#   swr_       — libswresample's shortcut prefix
+#   ff_        — FFmpeg INTERNAL cross-file symbols (library-private but
+#                marked external for inter-.o linkage). EVERY .c inside
+#                libavcodec/libavformat/libavutil/libswscale/libswresample/
+#                libavfilter that exposes anything to its sibling .c's uses
+#                this prefix (mathtables.o defines `_ff_crop_tab`,
+#                cavsdsp.o references it, etc.). MUST be in the merge
+#                set or `ld -r` produces a partial-link with dangling
+#                refs.
+#   avpriv_    — FFmpeg internal cross-library helpers (rarer than ff_).
 
 # Filenames that are obviously VLC's FFmpeg plugin wrappers. These reference
 # FFmpeg API even when they don't define any `_av_*` symbol themselves, so
