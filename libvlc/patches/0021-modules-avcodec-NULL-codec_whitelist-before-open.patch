@@ -1,0 +1,75 @@
+From 8c8d24302a964eb130521aa2f4eda54af292e6fe Mon Sep 17 00:00:00 2001
+From: VLCKit Aloha Release <devnull@alohabrowser.com>
+Date: Tue, 19 May 2026 15:37:53 +0300
+Subject: [PATCH] modules: codec: avcodec: NULL codec_whitelist before
+ avcodec_open2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Empirically observed: after the EsOutChangePosition NULL-clock guard
+landed in -aloha08, the libvlc input thread proceeded further into
+decoder init and crashed inside FFmpeg's av_match_list at offset
+0xFFFFFFFF00000000:
+
+  av_match_list
+    OpenVideoCodec
+    InitVideoDec
+    vlc_module_load
+    decoder_LoadModule
+    EsOutCreateDecoder
+    EsOutSelectEs
+    ...
+
+av_match_list dereferences the codec_whitelist string pointer from
+AVCodecContext. That field is normally NULL after avcodec_alloc_context3
+because av_mallocz zero-initialises the struct, and VLC never assigns
+codec_whitelist anywhere. In our static-library build packaged through
+aloha_ld_r_repack.py, however, the field has been observed holding
+post-stack garbage by the time OpenVideoCodec runs — most likely a
+struct-layout subtlety between contrib/ffmpeg's avcodec.h offsets at
+VLC compile time and the AVCodecContext actually allocated at runtime.
+The same root cause produced these messages in the logs prior to the
+crash:
+
+  [hevc_videotoolbox @ ...] Codec (hevc_videotoolbox) not on whitelist 'XXX'
+  [mpeg4 @ ...] Codec (mpeg4) not on whitelist 'XXX'
+
+where 'XXX' is uninitialised bytes from the same struct slot.
+
+Pinning codec_whitelist and format_whitelist to NULL right before
+avcodec_open2 is harmless (NULL = no whitelist = allow everything, the
+implicit default VLC always intended) and makes the crash impossible
+regardless of why the field was getting non-NULL garbage.
+---
+ modules/codec/avcodec/avcodec.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/modules/codec/avcodec/avcodec.c b/modules/codec/avcodec/avcodec.c
+index 81c5525151..b89e59e0f2 100644
+--- a/modules/codec/avcodec/avcodec.c
++++ b/modules/codec/avcodec/avcodec.c
+@@ -289,6 +289,20 @@ int ffmpeg_OpenCodec( decoder_t *p_dec, AVCodecContext *ctx,
+         free(psz_opts);
+     }
+ 
++    /* Aloha: explicitly NULL the codec/format whitelist pointers before
++     * avcodec_open2. These fields are nominally zero-initialised by
++     * avcodec_alloc_context3() (which uses av_mallocz), but in static-
++     * library builds of FFmpeg+VLC packaged through aloha_ld_r_repack.py
++     * we have observed them holding stack-garbage values like
++     * 0xFFFFFFFF00000000 by the time OpenVideoCodec runs. FFmpeg's
++     * avcodec_open2 then passes the garbage pointer to av_match_list,
++     * which dereferences it as a char* and crashes the input thread
++     * with KERN_INVALID_ADDRESS. Setting them NULL here is harmless
++     * (NULL = "no whitelist, all codecs allowed", which is what VLC
++     * always intended) and prevents the crash regardless of the
++     * underlying root cause. */
++    ctx->codec_whitelist = NULL;
++
+     vlc_avcodec_lock();
+     ret = avcodec_open2( ctx, codec, options ? &options : NULL );
+     vlc_avcodec_unlock();
+-- 
+2.50.1 (Apple Git-155)
+
