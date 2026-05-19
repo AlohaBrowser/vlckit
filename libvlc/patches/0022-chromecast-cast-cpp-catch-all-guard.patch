@@ -1,0 +1,84 @@
+From 1c4e5df0ef7048f019821943c50305dbab804f78 Mon Sep 17 00:00:00 2001
+From: VLCKit Aloha Release <devnull@alohabrowser.com>
+Date: Tue, 19 May 2026 19:42:25 +0300
+Subject: [PATCH] chromecast: cast.cpp: catch-all guard for intf_sys_t
+ constructor
+
+aloha07 onwards: opening Downloads no longer crashes the input thread.
+But picking a Chromecast device in the picker still terminates the
+app on iPhone 15:
+
+  libc++abi: terminating due to uncaught exception of type
+  std::runtime_error: Failed to create client session
+
+The throw site is ChromecastCommunication's constructor when
+vlc_tls_SocketOpenTLS() returns NULL after a failed TLS handshake.
+That constructor runs from inside intf_sys_t::intf_sys_t() which is
+in turn called from cast.cpp's Open(). Open() *does* wrap the call
+in try { ... } catch (const std::runtime_error&) { ... } catch
+(const std::bad_alloc&) { ... }, so the exception should be caught
+and the module should report a graceful failure.
+
+It isn't, because patches 0017/0018 compile libvlc + every contrib
+with -fvisibility=hidden. Apple clang treats the typeinfo / vtable
+symbols for std::runtime_error as local to each .o that throws or
+catches it. The catch block's typed match against
+std::runtime_error then fails for an exception thrown from a
+different TU -- their type_info pointers are not identical even
+though the type is. The exception escapes Open(), unwinds out to
+the stream-out worker thread root, hits no handler, and
+terminate() kills the app.
+
+The clean fix would be to drop -fvisibility=hidden for type_info
+symbols (or for the chromecast TUs specifically), but doing that
+re-opens the FFmpeg symbol-collision problem that the visibility
+patches were added to close, and risks breaking the very fragile
+ld -r repack pipeline.
+
+A surgical catch (...) at the throw site's nearest synchronous
+caller is safe: it catches the exception regardless of typeinfo
+identity, logs a generic failure, and routes through the existing
+error cleanup path exactly like the typed std::runtime_error
+branch above. Behaviour is identical to a successful typed catch:
+the Chromecast renderer fails to attach, the app stays alive, and
+the user can try again or pick a different device.
+---
+ modules/stream_out/chromecast/cast.cpp | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/modules/stream_out/chromecast/cast.cpp b/modules/stream_out/chromecast/cast.cpp
+index 65c312a00e..3085a5194b 100644
+--- a/modules/stream_out/chromecast/cast.cpp
++++ b/modules/stream_out/chromecast/cast.cpp
+@@ -1312,6 +1312,28 @@ static int Open(vlc_object_t *p_this)
+         p_intf = NULL;
+         goto error;
+     }
++    /* Aloha: catch-all guard. With patches 0017/0018 applied,
++     * libvlc and all contribs are compiled with -fvisibility=hidden, which
++     * also hides C++ typeinfo / vtable symbols. A `throw std::runtime_error`
++     * from chromecast_communication.cpp can then fail to match the typed
++     * `catch (const std::runtime_error&)` above, because the type_info
++     * objects in the throw TU and the catch TU are no longer the same
++     * (both are local to their own .o file). The exception then propagates
++     * to the worker thread root and `terminate()` kills the app:
++     *
++     *   libc++abi: terminating due to uncaught exception of type
++     *   std::runtime_error: Failed to create client session
++     *
++     * Catch (...) here is a guaranteed match regardless of how the
++     * type_info symbols ended up linked. Behaviour is the same as the
++     * typed `std::runtime_error` branch: log a generic failure and goto
++     * the error cleanup path. */
++    catch (...)
++    {
++        msg_Err( p_this, "cannot load the Chromecast controller (unknown error)" );
++        p_intf = NULL;
++        goto error;
++    }
+ 
+     b_supports_video = var_GetBool(p_stream, SOUT_CFG_PREFIX "video");
+ 
+-- 
+2.50.1 (Apple Git-155)
+
