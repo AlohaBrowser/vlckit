@@ -22,3 +22,4 @@ MobileVLCKit/ImportedSources
 Tests/Assets
 Headers/Internal/vlc-plugins-*
 VLCKit-*
+Package.swift.local

@@ -589,7 +589,7 @@ if [ "$VLCROOT" = "" ]; then
             cd vlc
             git checkout -B localBranch ${TESTEDHASH}
             git branch --set-upstream-to=origin/master localBranch
-            git am ${ROOT_DIR}/libvlc/patches/*.patch
+            git am "${ROOT_DIR}"/libvlc/patches/*.patch
             if [ $? -ne 0 ]; then
                 git am --abort
                 info "Applying the patches failed, aborting git-am"
@@ -598,9 +598,21 @@ if [ "$VLCROOT" = "" ]; then
             cd ..
         else
             cd vlc
-            git fetch --all
-            git reset --hard ${TESTEDHASH}
-            git am ${ROOT_DIR}/libvlc/patches/*.patch
+            # If HEAD already includes our latest patch, treat the tree as
+            # fully prepared and skip the fetch+reset+am cycle — the cycle
+            # destroys any local commits and re-applies patches naively, which
+            # fails when ROOT_DIR contains spaces (e.g. the "aloha-browser-ios
+            # copy" worktree). The presence of the most-recent patch's commit
+            # subject in `git log` is enough of a check: if we're missing it,
+            # do the full reset+am dance; if we have it, the working tree is
+            # already correct.
+            if git log -1 --pretty=%s | grep -q "guard against NULL clocks.input/main"; then
+                info "vlc/ already has all patches applied — skipping reset+am cycle"
+            else
+                git fetch --all
+                git reset --hard ${TESTEDHASH}
+                git am "${ROOT_DIR}"/libvlc/patches/*.patch
+            fi
             cd ..
         fi
     fi

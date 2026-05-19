@@ -1,0 +1,52 @@
+From 9f0cfbcacd83ee969a1f58ddf1d24813132594ed Mon Sep 17 00:00:00 2001
+From: VLCKit Aloha Release <devnull@alohabrowser.com>
+Date: Tue, 19 May 2026 09:12:47 +0300
+Subject: [PATCH] input: es_out: guard against NULL clocks.input/main in
+ EsOutChangePosition
+
+p_pgrm->clocks.input is initialized to NULL in EsOutProgramAdd and only
+assigned later, once a decoder attaches and a master ES clock is
+published. p_pgrm->clocks.main is allocated when the program is created
+via vlc_clock_main_New(), but the codebase's destructor path
+(ProgramDelete) already NULL-guards both pointers, acknowledging that
+they can legitimately be NULL during the program's lifetime.
+
+EsOutChangePosition is invoked whenever the input changes position
+(seek, restart, thumbnail extraction). In thumbnail mode and other
+early-control scenarios, position control commands can be issued through
+this code path BEFORE any decoder has attached and published a clock --
+so p_pgrm->clocks.input is still NULL when this function runs. Calling
+vlc_clock_main_Lock(NULL) / vlc_clock_Reset(NULL) then dereferences a
+NULL pointer (vlc_clock_t::owner at offset 8) and crashes the libvlc
+input thread with KERN_INVALID_ADDRESS at 0x8.
+
+Apply the same NULL guards used by ProgramDelete.
+---
+ src/input/es_out.c | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/src/input/es_out.c b/src/input/es_out.c
+index 0f295c17c6..48d7aab6ae 100644
+--- a/src/input/es_out.c
++++ b/src/input/es_out.c
+@@ -969,10 +969,14 @@ static void EsOutChangePosition(es_out_sys_t *p_sys, bool b_flush,
+     vlc_list_foreach(pgrm, &p_sys->programs, node)
+     {
+         input_clock_Reset(pgrm->p_input_clock);
+-        vlc_clock_main_Lock(pgrm->clocks.main);
+         pgrm->i_last_pcr = VLC_TICK_INVALID;
+-        vlc_clock_Reset(pgrm->clocks.input);
+-        vlc_clock_main_Unlock(pgrm->clocks.main);
++        if (pgrm->clocks.main != NULL)
++        {
++            vlc_clock_main_Lock(pgrm->clocks.main);
++            if (pgrm->clocks.input != NULL)
++                vlc_clock_Reset(pgrm->clocks.input);
++            vlc_clock_main_Unlock(pgrm->clocks.main);
++        }
+     }
+ 
+     p_sys->b_buffering = true;
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,67 @@
+From e3931ad90c4d07ea21ab685559797fae4e572be2 Mon Sep 17 00:00:00 2001
+From: VLCKit Aloha Release <devnull@alohabrowser.com>
+Date: Tue, 19 May 2026 09:28:37 +0300
+Subject: [PATCH] contrib: main.mak: use --buildtype release instead of
+ debugoptimized
+
+Meson's --buildtype debugoptimized auto-injects -D_LIBCPP_ENABLE_ASSERTIONS=1
+into every C++ compile command, including subprojects pulled in via
+subprojects/<name>/meson.build. Xcode 26.2's libc++ has REMOVED that macro
+and now turns any -D_LIBCPP_ENABLE_ASSERTIONS=1 into a hard #error:
+
+  error: "_LIBCPP_ENABLE_ASSERTIONS has been removed,
+          please use _LIBCPP_HARDENING_MODE instead"
+
+Patch 0013 already neutralises the macro for the top-level harfbuzz
+project via VLC's CXXFLAGS (write_config_mak appends -U_LIBCPP_ENABLE_ASSERTIONS
+-D_LIBCPP_HARDENING_MODE=...). Those flags get fed into meson's
+-Dcpp_args, but meson does not forward -Dcpp_args into subprojects. The
+ragel-6.10 subproject inside harfbuzz therefore still gets only meson's
+auto-debug flags, hits the libc++ #error, and breaks the build.
+
+Switch to --buildtype release. Meson stops auto-injecting the libc++
+debug macro for non-debug builds, and the subprojects compile clean
+against Xcode 26.2's libc++. The resulting contribs are also smaller
+(unused symbol stripping etc.).
+---
+ contrib/src/main.mak | 24 +++++++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/contrib/src/main.mak b/contrib/src/main.mak
+index 8d2b7a4dbf..691aa22659 100644
+--- a/contrib/src/main.mak
++++ b/contrib/src/main.mak
+@@ -516,7 +516,29 @@ MESONFLAGS = $(BUILD_DIR) $< --default-library static --prefix "$(PREFIX)" \
+ ifndef WITH_OPTIMIZATION
+ MESONFLAGS += --buildtype debug
+ else
+-MESONFLAGS += --buildtype debugoptimized
++# Aloha: was --buildtype debugoptimized. Two issues with that:
++#
++#   1. Meson's `get_assert_args()` (mesonbuild/compilers/cpp.py) inserts
++#      `-D_LIBCPP_ENABLE_ASSERTIONS=1` into every C++ compile command for
++#      Clang 15..17 unless assertions are explicitly disabled (b_ndebug).
++#      The flag is added at the project level AND propagates into every
++#      meson subproject, e.g. harfbuzz->ragel-6.10. Xcode 26.2's libc++
++#      converts that macro into a hard #error:
++#        "_LIBCPP_ENABLE_ASSERTIONS has been removed,
++#         please use _LIBCPP_HARDENING_MODE instead"
++#      and the build fails.
++#
++#   2. Patch 0013 (apple/build.sh) already appends
++#      -U_LIBCPP_ENABLE_ASSERTIONS to CXXFLAGS so meson's `-Dcpp_args`
++#      contains the undef, BUT meson does NOT forward `-Dcpp_args` into
++#      subprojects -- only the auto-injected debug args propagate -- so
++#      the undef never reaches ragel-6.10's compile commands.
++#
++# Switching to `release` + `-Db_ndebug=true` is the minimal change that
++# makes meson skip the auto-assertion-macro injection entirely (the
++# `disable=True` branch in `get_assert_args` returns just `-DNDEBUG`).
++# Subprojects then build clean against Xcode 26.2's libc++.
++MESONFLAGS += --buildtype release -Db_ndebug=true
+ endif
+ ifdef HAVE_BITCODE_ENABLED
+ MESONFLAGS += -Db_bitcode=true
+-- 
+2.50.1 (Apple Git-155)
+
