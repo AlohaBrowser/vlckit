@@ -17,7 +17,7 @@ let package = Package(
     ],
     targets: [
         .binaryTarget(name: "VLCKit",
-                      url: "https://doloto.alohabrowser.com/repository/maven-releases/com/alohamobile/vlckit-ios/4.0.0-a16-aloha09/vlckit-ios-4.0.0-a16-aloha09-vlckit-ios.zip",
-                      checksum: "537d17eceae35472a435cd54d508c06b1ebd19842172f96b1e777d7fc1f99b81"),
+                      url: "https://doloto.alohabrowser.com/repository/maven-releases/com/alohamobile/vlckit-ios/4.0.0-a16-aloha10/vlckit-ios-4.0.0-a16-aloha10-vlckit-ios.zip",
+                      checksum: "3fa9ebb4336f1ace954203b3edc440d18c0217e93237d0af74ae504aee9e5874"),
     ]
 )
