@@ -90,9 +90,23 @@ import tempfile
 # with the consumer dylib link step. Restricting the merge to FFmpeg-
 # related .o files only is the empirical fix.
 FFMPEG_SYMBOL_RE = re.compile(
-    rb"_(av|avcodec|avformat|avutil|swscale|swresample|swr|avfilter|postproc"
-    rb"|avdevice|ff|avpriv)_"
+    rb"^_(av|avcodec|avformat|avutil|swscale|swresample|swr|avfilter|postproc"
+    rb"|avdevice|ff|avpriv)_",
+    re.MULTILINE,
 )
+# CRITICAL: anchored at line start (re.MULTILINE) — must match a SYMBOL
+# starting with the FFmpeg prefix, not the prefix as a substring inside
+# some other symbol's name.
+#
+# Without the `^` anchor, files like `static-module-list.o` (VLC's
+# generated plugin registry, 253 `_vlc_entry__codec_avcodec_*`,
+# `_vlc_entry__demux_avformat_*`, … strings) and `VLCLibrary.o` would
+# get mis-flagged as FFmpeg-related — `_avcodec_` is a substring of
+# `_vlc_entry__codec_avcodec_libavcodec`. Pulling those into the
+# merge set then triggers a duplicate-symbol error at `ld -r` for
+# `_vlc_static_modules`, which is defined as a stub in VLCLibrary.o
+# (8-byte placeholder, external) AND as the real plugin table in
+# static-module-list.o (~18 KB, private external).
 # Notes on what each prefix catches:
 #   av_/avcodec_/avformat_/avutil_/swscale_/swresample_/avfilter_/avdevice_/
 #   postproc_  — FFmpeg PUBLIC API symbols
@@ -122,34 +136,58 @@ FFMPEG_PLUGIN_NAME_RE = re.compile(
 # empirically (the kept member is the one whose symbols are actually used at
 # runtime; the dropped one is the redundant libtool-generated sibling).
 KNOWN_DUPLICATE_DROPS = {
-    # _vlc_static_modules — keep VLCLibrary.o (also exports the public
-    # ObjC class _OBJC_CLASS_$_VLCLibrary that consumer apps need); drop
-    # the generated module-list .o that only has the symbol table.
-    "static-module-list.o",
-    # _avas_GetPortType / _avas_PrepareFormat / _avas_SetActive —
-    # libtool packages avaudiosession_common.c twice. Keep the
-    # plugin-prefixed copy (libavsamplebuffer_plugin_la-…) which is
-    # what the plugin actually loads; drop the plain one.
-    "avaudiosession_common.o",
-    # _strverscmp — gnulib provides two copies. Keep libtool one.
-    "strverscmp.o",
-    # _clock_gettime — VLC's compat shim duplicates a platform helper.
-    # Keep the plugin-side one.
-    "compat_clock_gettime.c.o",
-    # _MD5Transform/_MD5Update/_MD5Init/_MD5Final — md5.c.o vs md5.c.o~3.
-    # Keep the ~3 version (libvlc-side); drop the plain one.
-    "md5.c.o",
-    # _MD5_Init / _MD5_Final / _MD5_Update — collision between libdsm's
-    # bundled MD5 (contrib_mdx_md5.c.o) and libvlc's md5 (md5.c__cidup3.o).
-    # Drop libdsm's copy; libvlc's MD5 is what plugins actually call.
-    "contrib_mdx_md5.c.o",
-    # _psz_vlc_changeset — revision string baked into libvlc and libvlccore
-    # by libtool from the same source. Drop libvlccore_la's copy; libvlc_la's
-    # is the canonical version VLCLibrary surfaces to consumers.
-    "libvlccore_la-revision.o",
-    # _ff_init_half2float_tables — FFmpeg's half-float lookup-table init,
-    # built twice (libavcodec + libswscale) with non-byte-identical
-    # variants. Drop the second copy; it's the same function.
+    # IMPORTANT: with the SELECTIVE `ld -r` strategy (FFmpeg-related .o
+    # only — see `is_ffmpeg_related`), most duplicate-symbol pairs that
+    # used to need explicit drops are now harmless: both members stay
+    # as separate kept archive entries, and Apple ld's demand-load at
+    # consumer-side full link picks one. The only drops we still need
+    # are for duplicates BOTH of which end up in the FFmpeg MERGE set,
+    # because `ld -r` strictly rejects duplicate symbols (unlike
+    # consumer-side full link which handles archive demand-loading
+    # gracefully).
+    #
+    # HISTORY: -aloha04..-aloha06 dropped a wider set
+    # (static-module-list.o, avaudiosession_common.o, strverscmp.o,
+    # compat_clock_gettime.c.o, md5.c.o, contrib_mdx_md5.c.o,
+    # libvlccore_la-revision.o). Those were needed for the broken
+    # whole-archive `ld -r` of -aloha04 because everything funneled
+    # through one giant ld -r where any duplicate aborted the link.
+    #
+    # The static-module-list.o drop was CATASTROPHIC: it removed VLC's
+    # generated plugin registry, leaving only VLCLibrary.o's stub
+    # `_vlc_static_modules` placeholder. libvlc then thought no
+    # plugins were registered. User-visible symptoms on iPhone 15
+    # with -aloha06:
+    #   (a) thumbnail generation silently fails for non-mp4 files
+    #       (no demuxer plugins reachable at runtime — TSThumbnailGenerator
+    #       fallback kicks in but only produces audio-artwork-style
+    #       placeholders, not real frame snapshots)
+    #   (b) Chromecast TLS handshake throws
+    #       std::runtime_error("Failed to create client session")
+    #       from cast.cpp because vlc_tls_ClientSessionCreate returns
+    #       NULL — the SecureTransport plugin
+    #       (_vlc_entry__misc_libsecuretransport) exists in the
+    #       archive but is unreachable through the (stub) static
+    #       module registry. Crash log:
+    #       /Users/artes/Library/Developer/Xcode/DeviceLogs/iPhone\ 15-*/
+    #       AlohaBrowserApp-2026-05-18-*.ips
+    #
+    # Fix: with selective `ld -r`, static-module-list.o never enters
+    # the merge set (it has zero FFmpeg-prefix symbols). So it stays
+    # as a separate archive member alongside VLCLibrary.o's
+    # placeholder, and Apple ld at consumer-side full link picks the
+    # real definition via standard demand-load resolution — same as
+    # the original VLCKit archives prior to any of our repack work.
+    # The same logic applies to all the other non-FFmpeg drops; only
+    # the FFmpeg-internal half2float pair actually needs dropping at
+    # the `ld -r` stage.
+
+    # _ff_init_half2float_tables — FFmpeg's half-float lookup table
+    # built twice in libtool (likely libavutil + libswscale variants).
+    # BOTH copies match the FFmpeg-prefix regex (ff_) so both land in
+    # the merge set, where `ld -r` strictly rejects the duplicate
+    # symbol. The two copies are functionally equivalent; drop the
+    # `__cidup1` sibling.
     "half2float__cidup1.o",
 }
 
