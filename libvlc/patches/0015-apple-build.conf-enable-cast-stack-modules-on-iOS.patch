@@ -11,10 +11,11 @@ diff --git a/extras/package/apple/build.conf b/extras/package/apple/build.conf
 index e64aa3a42d..6a71af5994 100644
 --- a/extras/package/apple/build.conf
 +++ b/extras/package/apple/build.conf
-@@ -91,6 +91,14 @@ export VLC_CONTRIB_OPTIONS_MACOSX=(
+@@ -91,6 +91,15 @@ export VLC_CONTRIB_OPTIONS_MACOSX=(
  export VLC_CONTRIB_OPTIONS_IOS=(
      --disable-aom
      --disable-rav1e
++    --disable-protobuf
 +    --enable-microdns
 +    --enable-upnp
 +    --enable-mpg123
@@ -36,7 +37,7 @@ index e64aa3a42d..6a71af5994 100644
 +# disables modules when pkg-config doesn't match the contrib install path
 +# perfectly, which silently breaks Cast and audio playback at runtime).
 +export VLC_CONFIG_OPTIONS_IOS=(
-+    --enable-chromecast
++    --disable-chromecast
 +    --enable-live555
 +    --enable-libgcrypt
 +    --enable-vpx
