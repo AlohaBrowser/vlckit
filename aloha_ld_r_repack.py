@@ -405,6 +405,52 @@ def select_for_relink(out_dir: str, filenames: list[str]) -> tuple[list[str], li
     return to_merge, to_keep
 
 
+def _resolve_llvm_objcopy() -> str:
+    """Locate a usable llvm-objcopy binary. Strategy:
+
+      1. PATH lookup (shutil.which) — picks up Homebrew installs at
+         /opt/homebrew/opt/llvm/bin/ if PATH includes it.
+      2. Hardcoded Homebrew Apple-Silicon path: /opt/homebrew/opt/llvm/bin.
+      3. Hardcoded Homebrew Intel path: /usr/local/opt/llvm/bin.
+      4. xcrun (Xcode toolchain) — only works on Xcode versions that
+         ship llvm-objcopy (NOT Xcode 26.2.0; verified 2026-06-05).
+
+    Returns the absolute path. Raises SystemExit with a remediation
+    message if none of the strategies finds it.
+    """
+    # Strategy 1: PATH
+    p = shutil.which("llvm-objcopy")
+    if p:
+        return p
+    # Strategy 2 + 3: known Homebrew prefixes
+    for candidate in (
+        "/opt/homebrew/opt/llvm/bin/llvm-objcopy",
+        "/usr/local/opt/llvm/bin/llvm-objcopy",
+        "/opt/homebrew/bin/llvm-objcopy",
+        "/usr/local/bin/llvm-objcopy",
+    ):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    # Strategy 4: xcrun
+    try:
+        res = subprocess.run(
+            ["xcrun", "--find", "llvm-objcopy"],
+            capture_output=True, text=True, check=True,
+        )
+        return res.stdout.strip()
+    except subprocess.CalledProcessError:
+        pass
+
+    raise SystemExit(
+        "aloha15: llvm-objcopy not found. Install via `brew install llvm` "
+        "(provides /opt/homebrew/opt/llvm/bin/llvm-objcopy on Apple "
+        "Silicon, /usr/local/opt/llvm/bin/llvm-objcopy on Intel). "
+        "Xcode 26.2.0 does NOT ship llvm-objcopy in its default "
+        "toolchain — `xcrun --find llvm-objcopy` returns exit 72. "
+        "Verified empirically 2026-06-05 during aloha15 publish."
+    )
+
+
 def localize_ffmpeg_library_symbols(merged_obj_path: str,
                                     slice_label: str,
                                     evidence_dir: str) -> None:
@@ -433,10 +479,8 @@ def localize_ffmpeg_library_symbols(merged_obj_path: str,
     full design decision record.
     """
     # Supply-chain visibility: pin toolchain version into build log.
-    res = subprocess.run(["xcrun", "--find", "llvm-objcopy"],
-                         capture_output=True, text=True, check=True)
-    objcopy_path = res.stdout.strip()
-    res = subprocess.run(["xcrun", "llvm-objcopy", "--version"],
+    objcopy_path = _resolve_llvm_objcopy()
+    res = subprocess.run([objcopy_path, "--version"],
                          capture_output=True, text=True, check=True)
     objcopy_ver = res.stdout.strip().split("\n")[0]
     print(f"[aloha15 localize {slice_label}] toolchain pin:")
@@ -474,7 +518,7 @@ def localize_ffmpeg_library_symbols(merged_obj_path: str,
 
     # Apply via explicit symbol list (NOT via glob). Mechanical record
     # of what changed is the load-bearing audit trail.
-    cmd = ["xcrun", "llvm-objcopy"]
+    cmd = [objcopy_path]
     for sym in candidates:
         cmd += ["--localize-symbol", sym]
     cmd.append(merged_obj_path)
