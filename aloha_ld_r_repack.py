@@ -196,6 +196,58 @@ KNOWN_DUPLICATE_DROPS = {
 ARCHIVE_METADATA_NAMES = {"__.SYMDEF", "__.SYMDEF SORTED", ""}
 
 
+# aloha15: post-ld-r symbol-table hygiene. After ld -r produces the
+# vlckit-ffmpeg-merged.o, we demote FFmpeg-library symbols (still
+# external in the output, because FFmpeg's PUBLIC API uses default
+# visibility) to STB_LOCAL via `llvm-objcopy --localize-symbol`. This
+# closes the runtime ABI-mismatch hang that surfaces when the consumer
+# app statically links BOTH this archive AND a separate
+# Modules/FFmpeg/libav*.xcframework: without aloha15, libvlc's
+# internal call sites bind to whichever copy ld picks first at consumer
+# link (typically Modules/FFmpeg's), causing struct-layout mismatches
+# and a deadlocked thumbnail decoder. With aloha15 — internal calls
+# stay bound to VLCKit's own FFmpeg copy by binary address (resolved
+# at ld -r time inside merged.o), and the external symbol table no
+# longer advertises them, so the consumer's calls go to
+# Modules/FFmpeg's copy without conflict.
+#
+# Implementation note (empirically grounded against aloha14 nm -gU
+# 2026-06-05):
+#   * The vlc-module entry-points whose names happen to match an
+#     FFmpeg-family prefix (e.g. `_avformat_OpenDemux`,
+#     `_avparser_OpenPacketizer`) are ALREADY in the merged.o as
+#     `non-external (was a private external)` — STB_LOCAL — because
+#     `ld -r -keep_private_externs` resolved their references to
+#     local addresses. Re-applying --localize-symbol on them is a
+#     no-op. KNOWN_VLC_ENTRY_POINTS below provides a safety belt for
+#     the bare-name entries (`_OpenAvio`, `_CloseAvio`, etc.) that
+#     would also slip through any name-based filter.
+#   * Earlier discriminator designs that excluded "CamelCase suffix"
+#     would have falsely kept FFmpeg NEON helpers (e.g.
+#     `_ff_abgr32ToUV_*`, `_ff_chrRangeFromJpeg_*`) global because
+#     their suffixes contain uppercase. Empirical test 2026-06-05
+#     showed these are FFmpeg-library code that MUST be localized.
+#     So the discriminator is simpler than initially specced:
+#     "matches FFmpeg-family prefix" → localize; no CamelCase rule.
+#
+# See docs/superpowers/specs/2026-06-04-vlckit-aloha15-localize-
+# symbol-addendum.md (in the consumer iOS-app repo) for the design
+# decision record.
+FFMPEG_LIBRARY_PREFIX_RE = re.compile(
+    rb"^_(ff|av|avcodec|avformat|avutil|avpriv|avfilter|avdevice"
+    rb"|swr|sws|postproc|ffurl)_",
+)
+
+# Safety belt for vlc-module bare-name entry-points that don't carry
+# any FFmpeg-family prefix but would still get caught if a future
+# build's FFMPEG_LIBRARY_PREFIX_RE were widened. (Currently none of
+# these match the prefix regex above — listed defensively.)
+KNOWN_VLC_ENTRY_POINTS = frozenset({
+    b"_OpenAvio", b"_CloseAvio",
+    b"_OpenCodec", b"_CloseCodec",
+})
+
+
 def parse_bsd_archive(path: str):
     """Yield (member_index, real_name, data_bytes) for every member."""
     idx = 0
@@ -353,6 +405,145 @@ def select_for_relink(out_dir: str, filenames: list[str]) -> tuple[list[str], li
     return to_merge, to_keep
 
 
+def localize_ffmpeg_library_symbols(merged_obj_path: str,
+                                    slice_label: str,
+                                    evidence_dir: str) -> None:
+    """aloha15: demote FFmpeg-library globals inside vlckit-ffmpeg-merged.o
+    from STB_GLOBAL to STB_LOCAL via `llvm-objcopy --localize-symbol`.
+
+    Operates on the single .o produced by run_ld_r BEFORE
+    repack_as_archive wraps it back into a static archive. After this
+    runs, no FFmpeg-family symbol in merged.o is visible in the
+    consumer's static-link global symbol table — they bind locally
+    (already resolved at `ld -r` time inside merged.o) but the
+    Mach-O symbol table entries are now LOCAL, invisible to ld at
+    consumer link.
+
+    Side effect: writes the localized-symbol list to
+    `evidence_dir/aloha15-localized-symbols-{slice_label}.txt` so the
+    consumer-side §3.1.7 plugin-loader-sanity verification step can
+    consume it after the build (the tempdir that holds merged_obj_path
+    is rmtree'd by main()'s finally clause, so the evidence file MUST
+    persist outside it).
+
+    See module-level FFMPEG_LIBRARY_PREFIX_RE for the discriminator and
+    KNOWN_VLC_ENTRY_POINTS for the safety-belt allow-list. See spec
+    addendum docs/superpowers/specs/2026-06-04-vlckit-aloha15-
+    localize-symbol-addendum.md in the consumer iOS-app repo for the
+    full design decision record.
+    """
+    # Supply-chain visibility: pin toolchain version into build log.
+    res = subprocess.run(["xcrun", "--find", "llvm-objcopy"],
+                         capture_output=True, text=True, check=True)
+    objcopy_path = res.stdout.strip()
+    res = subprocess.run(["xcrun", "llvm-objcopy", "--version"],
+                         capture_output=True, text=True, check=True)
+    objcopy_ver = res.stdout.strip().split("\n")[0]
+    print(f"[aloha15 localize {slice_label}] toolchain pin:")
+    print(f"[aloha15 localize {slice_label}]   path: {objcopy_path}")
+    print(f"[aloha15 localize {slice_label}]   version: {objcopy_ver}")
+
+    # Enumerate globally-defined T/D/B symbols matching FFmpeg-family
+    # prefix. `nm` output format: "<addr> <type> <name>".
+    res = subprocess.run(
+        ["xcrun", "nm", merged_obj_path],
+        capture_output=True, text=True, check=True,
+    )
+    candidates: list[str] = []
+    for line in res.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        symtype, name = parts[1], parts[2]
+        if symtype not in {"T", "D", "B"}:
+            continue
+        name_b = name.encode("ascii", errors="replace")
+        if name_b in KNOWN_VLC_ENTRY_POINTS:
+            continue  # Safety belt — keep vlc-module entry-points global.
+        if FFMPEG_LIBRARY_PREFIX_RE.match(name_b):
+            candidates.append(name)
+
+    print(f"[aloha15 localize {slice_label}] {len(candidates)} "
+          f"FFmpeg-library globals selected for STB_LOCAL demotion")
+    if not candidates:
+        print(f"[aloha15 localize {slice_label}] WARN: empty candidate "
+              f"list — discriminator may be over-narrow or upstream "
+              f"is_ffmpeg_related changed shape. Continuing without "
+              f"any --localize-symbol pass.", file=sys.stderr)
+        return
+
+    # Apply via explicit symbol list (NOT via glob). Mechanical record
+    # of what changed is the load-bearing audit trail.
+    cmd = ["xcrun", "llvm-objcopy"]
+    for sym in candidates:
+        cmd += ["--localize-symbol", sym]
+    cmd.append(merged_obj_path)
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        sys.stderr.write(
+            "llvm-objcopy --localize-symbol failed:\n"
+        )
+        sys.stderr.write(res.stderr)
+        raise SystemExit(res.returncode)
+    if res.stderr.strip():
+        sys.stderr.write(res.stderr)
+
+    # Persist the localized-symbol list outside the tempdir so the
+    # consumer-side §3.1.7 plugin-loader-sanity verification can find
+    # it post-build. Filename includes slice_label so device + sim
+    # slices don't overwrite each other.
+    safe_label = slice_label.replace("/", "-").replace(" ", "-")
+    list_path = os.path.join(
+        evidence_dir,
+        f"aloha15-localized-symbols-{safe_label}.txt"
+    )
+    with open(list_path, "w") as f:
+        for sym in sorted(candidates):
+            f.write(sym + "\n")
+    print(f"[aloha15 localize {slice_label}] wrote evidence: "
+          f"{list_path} ({len(candidates)} symbols)")
+
+    # Self-verification: re-scan merged.o and confirm no FFmpeg-
+    # library globals remain. If any do, the discriminator misclass-
+    # ified or llvm-objcopy didn't honor the list — abort with a
+    # diagnostic dump so the operator can extend the discriminator.
+    res = subprocess.run(
+        ["xcrun", "nm", merged_obj_path],
+        capture_output=True, text=True, check=True,
+    )
+    leaked: list[str] = []
+    for line in res.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        symtype, name = parts[1], parts[2]
+        if symtype not in {"T", "D", "B"}:
+            continue
+        name_b = name.encode("ascii", errors="replace")
+        if name_b in KNOWN_VLC_ENTRY_POINTS:
+            continue
+        if FFMPEG_LIBRARY_PREFIX_RE.match(name_b):
+            leaked.append(name)
+
+    if leaked:
+        sys.stderr.write(
+            f"[aloha15 localize {slice_label}] FAIL: "
+            f"{len(leaked)} FFmpeg-library globals remain after "
+            f"--localize-symbol. Top 50:\n"
+        )
+        for s in leaked[:50]:
+            sys.stderr.write(f"    {s}\n")
+        raise SystemExit(
+            f"aloha15 localize: {len(leaked)} symbols leaked in "
+            f"{slice_label} ({merged_obj_path}). Either "
+            f"llvm-objcopy did not honor the --localize-symbol "
+            f"list or the FFMPEG_LIBRARY_PREFIX_RE / KNOWN_VLC_ENTRY"
+            f"_POINTS discriminator misclassified them."
+        )
+    print(f"[aloha15 localize {slice_label}] OK — 0 FFmpeg-library "
+          f"globals remain after demotion")
+
+
 def run_ld_r(out_dir: str, files: list[str], arch: str, platform: str,
              min_os: str, max_os: str, out_o: str) -> None:
     """Invoke `xcrun ld -r` to produce a single relocatable .o."""
@@ -464,6 +655,16 @@ def main() -> None:
         combined_o = os.path.join(tmp, "vlckit-ffmpeg-merged.o")
         run_ld_r(tmp, to_merge, arch, platform, min_os, max_os, combined_o)
         print(f"[aloha_ld_r_repack] ffmpeg-merged .o: {os.path.getsize(combined_o)} bytes")
+
+        # aloha15: demote FFmpeg-library globals to STB_LOCAL inside
+        # combined_o BEFORE the libtool repack. Evidence file written
+        # to dirname(archive) so it persists past tempdir cleanup.
+        evidence_dir = os.path.dirname(os.path.abspath(archive))
+        localize_ffmpeg_library_symbols(
+            combined_o,
+            slice_label=f"{arch}-{platform}",
+            evidence_dir=evidence_dir,
+        )
 
         repack_as_archive(tmp, archive, combined_o, to_keep)
         print(f"[aloha_ld_r_repack] repacked archive: "
