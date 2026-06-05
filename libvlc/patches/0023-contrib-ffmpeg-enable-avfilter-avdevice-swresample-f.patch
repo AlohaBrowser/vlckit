@@ -1,0 +1,66 @@
+From 8adbfa071ffe80a8c8d1e53bc85f69fb8931517b Mon Sep 17 00:00:00 2001
+From: Sergey Artemenchuk <artes@alohabrowser.com>
+Date: Fri, 5 Jun 2026 12:59:13 +0300
+Subject: [PATCH] contrib: ffmpeg: enable avfilter / avdevice / swresample /
+ filters / bsfs for monolith consumers
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+iOS monolith static builds link both VLCKit's bundled FFmpeg and a
+separate Modules/FFmpeg's libav*.xcframework (driven by ffmpegkit's
+~470 undefined _av_* external refs from libffmpegkit_la-fftools_*.o).
+
+The two FFmpeg copies with different ABIs cause runtime EXC_BAD_ACCESS
+at av_log on swscale OpenScaler in libvlc's thumbnail thread.
+
+To unify on VLCKit's bundled FFmpeg, the consumer drops Modules/FFmpeg
+libav* deps + force_loads VLCKit so all libvlc + ffmpegkit refs bind
+to VLCKit's own FFmpeg. But VLCKit's iphoneos build strips
+libavfilter / libavdevice / libswresample which ffmpegkit needs:
+- libavfilter: _av_buffersink_*, _av_buffersrc_*, _avfilter_* (~43)
+- libavdevice: _avdevice_* (~6)
+- libswresample: _swr_*, _swresample_* (~5)
+- filters + bsfs (concat protocol, aac_adtstoasc bsf, etc.) needed
+  by ffmpegkit's CLI tools for MP4 concat in StreamRecording.
+
+Enabling these in ffmpeg's contrib build adds ~20-30 MB to VLCKit
+but removes ~60 MB of duplicate libav* from Modules/FFmpeg — net
+binary size impact is approximately neutral or slightly negative.
+
+Refs: AlohaBrowser/aloha-browser-ios feature/CU-86eq9n2ta_vlc-kit.
+---
+ contrib/src/ffmpeg/rules.mak | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/contrib/src/ffmpeg/rules.mak b/contrib/src/ffmpeg/rules.mak
+index 7ebc37dab1..21dd7c4d2e 100644
+--- a/contrib/src/ffmpeg/rules.mak
++++ b/contrib/src/ffmpeg/rules.mak
+@@ -24,16 +24,16 @@ FFMPEGCONF = --prefix="$(PREFIX)" --enable-static --disable-shared \
+ 	--enable-libgsm \
+ 	--enable-libopenjpeg \
+ 	--disable-debug \
+-	--disable-avdevice \
+-	--disable-devices \
+-	--disable-avfilter \
+-	--disable-filters \
+-	--disable-protocol=concat \
+-	--disable-bsfs \
++	--enable-avdevice \
++	--enable-devices \
++	--enable-avfilter \
++	--enable-filters \
++	--enable-protocol=concat \
++	--enable-bsfs \
+ 	--disable-bzlib \
+ 	--disable-libvpx \
+ 	--enable-bsf=vp9_superframe \
+-	--disable-swresample \
++	--enable-swresample \
+ 	--disable-iconv \
+ 	--disable-avisynth \
+ 	--disable-nvenc \
+-- 
+2.50.1 (Apple Git-155)
+
