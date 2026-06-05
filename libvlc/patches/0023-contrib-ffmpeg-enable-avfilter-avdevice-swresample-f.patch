@@ -1,4 +1,4 @@
-From 43ad15b841f2e78a5a192fd1952208cbeb5f16f5 Mon Sep 17 00:00:00 2001
+From ebc4a28a66b9ceca6a2589ee20e51f345a101439 Mon Sep 17 00:00:00 2001
 From: Sergey Artemenchuk <artes@alohabrowser.com>
 Date: Fri, 5 Jun 2026 12:59:13 +0300
 Subject: [PATCH] contrib: ffmpeg: enable avfilter / avdevice / swresample /
@@ -30,14 +30,14 @@ binary size impact is approximately neutral or slightly negative.
 
 Refs: AlohaBrowser/aloha-browser-ios feature/CU-86eq9n2ta_vlc-kit.
 ---
- contrib/src/ffmpeg/rules.mak | 13 ++++++-------
- 1 file changed, 6 insertions(+), 7 deletions(-)
+ contrib/src/ffmpeg/rules.mak | 15 ++++++++-------
+ 1 file changed, 8 insertions(+), 7 deletions(-)
 
 diff --git a/contrib/src/ffmpeg/rules.mak b/contrib/src/ffmpeg/rules.mak
-index 7ebc37dab1..b091a96e45 100644
+index 7ebc37dab1..bf456509bb 100644
 --- a/contrib/src/ffmpeg/rules.mak
 +++ b/contrib/src/ffmpeg/rules.mak
-@@ -24,16 +24,15 @@ FFMPEGCONF = --prefix="$(PREFIX)" --enable-static --disable-shared \
+@@ -24,16 +24,17 @@ FFMPEGCONF = --prefix="$(PREFIX)" --enable-static --disable-shared \
  	--enable-libgsm \
  	--enable-libopenjpeg \
  	--disable-debug \
@@ -48,6 +48,8 @@ index 7ebc37dab1..b091a96e45 100644
 -	--disable-protocol=concat \
 -	--disable-bsfs \
 +	--enable-avdevice \
++	--disable-indevs \
++	--disable-outdevs \
 +	--enable-avfilter \
 +	--enable-filters \
 +	--enable-protocol=concat \
