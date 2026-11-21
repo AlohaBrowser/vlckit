@@ -1,0 +1,41 @@
+From dd1dfc27cf58ab8ec50ee72f5d330d70e73efb59 Mon Sep 17 00:00:00 2001
+From: JustFox <hello@justfox.dev>
+Date: Wed, 15 Jul 2026 17:25:55 +0200
+Subject: [PATCH 27/27] package/macosx: force dup3()/pipe2() undetected (not
+ declared in Apple SDK headers)
+
+Backport of videolan/vlc 192ecc334277b2533046fddc67714424554db595 onto
+8e3d17c89 without 5d30bfaf6a. The first hunk adds a comment only; its
+context is the base's list of macOS/iOS symbol additions instead of
+5d30bfaf6a's ac_cv_prog_cc_c23 comment. The second hunk is upstream's.
+---
+ extras/package/macosx/env.build.sh | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/extras/package/macosx/env.build.sh b/extras/package/macosx/env.build.sh
+index ffb6a73..46e1a6f 100755
+--- a/extras/package/macosx/env.build.sh
++++ b/extras/package/macosx/env.build.sh
+@@ -115,6 +115,9 @@ vlcSetSymbolEnvironment() {
+     # - Added symbols in macOS 10.13 / iOS 11 / watchOS 4 / tvOS 11
+     # - Added symbol in macOS 10.14 / iOS 12 / tvOS 9
+     # - Added symbols in macOS 10.15 / iOS 13 / tvOS 13
++    #
++    # ac_cv_func_dup3 / ac_cv_func_pipe2: undeclared in Apple SDK headers but
++    #   falsely link-detectable since iOS simulator SDK 26.4.
+     "${cmd}" "$@" \
+     \
+     ac_cv_func_basename_r=no \
+@@ -133,6 +136,9 @@ vlcSetSymbolEnvironment() {
+     ac_cv_func_futimens=no \
+     ac_cv_func_utimensat=no \
+     \
++    ac_cv_func_dup3=no \
++    ac_cv_func_pipe2=no \
++    \
+     ac_cv_func_thread_get_register_pointer_values=no \
+     \
+     ac_cv_func_aligned_alloc=no \
+-- 
+2.54.0 (Apple Git-157)
+
