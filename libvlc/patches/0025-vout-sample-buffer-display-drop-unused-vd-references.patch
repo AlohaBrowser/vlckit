@@ -1,0 +1,59 @@
+From fbec8c9807390c055845f476cdf334a169749301 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Felix=20Paul=20K=C3=BChne?= <fkuehne@videolan.org>
+Date: Thu, 25 Jun 2026 10:51:28 +0200
+Subject: [PATCH 25/27] vout/sample buffer display: drop unused vd references
+
+Backport of videolan/vlc 82803f4e26ddb26f0b8ed228b5bfeaad1c92a001 onto
+8e3d17c89. VLCSampleBufferDisplayView's vd property is never read, so
+the view no longer keeps a pointer to a vout display that can be freed
+before it. The prepareDisplay hunks are adapted to the base, which has
+no frameForPlace: (see the previous patch).
+---
+ modules/video_output/apple/VLCSampleBufferDisplay.m | 9 ++-------
+ 1 file changed, 2 insertions(+), 7 deletions(-)
+
+diff --git a/modules/video_output/apple/VLCSampleBufferDisplay.m b/modules/video_output/apple/VLCSampleBufferDisplay.m
+index f64a476..7c53a84 100644
+--- a/modules/video_output/apple/VLCSampleBufferDisplay.m
++++ b/modules/video_output/apple/VLCSampleBufferDisplay.m
+@@ -565,18 +565,15 @@ - (void)drawRect:(CGRect)dirtyRect {
+ #pragma mark -
+ 
+ @interface VLCSampleBufferDisplayView: VLCView <CALayerDelegate>
+-@property (nonatomic, readonly) vout_display_t *vd;
+-- (instancetype)initWithVoutDisplay:(vout_display_t *)vd;
+ - (AVSampleBufferDisplayLayer *)displayLayer;
+ @end
+ 
+ @implementation VLCSampleBufferDisplayView
+ 
+-- (instancetype)initWithVoutDisplay:(vout_display_t *)vd {
++- (instancetype)init {
+     self = [super init];
+     if (!self)
+         return nil;
+-    _vd = vd;
+ #if TARGET_OS_OSX
+     self.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+     self.wantsLayer = YES;
+@@ -721,7 +718,6 @@ - (void)prepareDisplay {
+     }
+ 
+     VLCSampleBufferDisplay *sys = self;
+-    vout_display_t *vd = _vd;
+     vout_display_place_t placeSnapshot = *_vd->place;
+     dispatch_async(dispatch_get_main_queue(), ^{
+         if (sys.displayView)
+@@ -731,8 +727,7 @@ - (void)prepareDisplay {
+         VLCSampleBufferSubpictureView *spuView;
+         VLCView *window = sys.window;
+ 
+-        displayView =
+-            [[VLCSampleBufferDisplayView alloc] initWithVoutDisplay:vd];
++        displayView = [[VLCSampleBufferDisplayView alloc] init];
+         spuView = [VLCSampleBufferSubpictureView new];
+         [window addSubview:displayView];
+         [window addSubview:spuView];
+-- 
+2.54.0 (Apple Git-157)
+

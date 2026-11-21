@@ -1,0 +1,56 @@
+From 32134366ff3b72cc21c2c2cd1b3e72905885e476 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Felix=20Paul=20K=C3=BChne?= <fkuehne@videolan.org>
+Date: Thu, 25 Jun 2026 10:33:23 +0200
+Subject: [PATCH 24/27] vout/sample buffer display: fix use-after-free
+
+Snapshot vd and the placement on the display thread and use the
+captured copies inside the block.
+
+Backport of videolan/vlc af61becb6cf8887dcbfc41918482a76db35f19c4 onto
+8e3d17c89, the libvlc revision VLCKit 4.0.0-a16 builds. The base
+predates da8b3130c0 (video placement support): its main-queue block
+copies vd->place into the sys->place ivar instead of computing a frame
+from it, so that line now stores the snapshot. The snapshot is named
+placeSnapshot because a local named place would shadow that ivar
+(-Wshadow-ivar). The first hunk is otherwise upstream's.
+
+A close during the open frees vd before the block runs; the block then
+read sys.vd->place on main (SIGSEGV in __40-[VLCSampleBufferDisplay
+prepareDisplay]_block_invoke).
+---
+ modules/video_output/apple/VLCSampleBufferDisplay.m | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/modules/video_output/apple/VLCSampleBufferDisplay.m b/modules/video_output/apple/VLCSampleBufferDisplay.m
+index 6b0dd20..f64a476 100644
+--- a/modules/video_output/apple/VLCSampleBufferDisplay.m
++++ b/modules/video_output/apple/VLCSampleBufferDisplay.m
+@@ -721,6 +721,8 @@ - (void)prepareDisplay {
+     }
+ 
+     VLCSampleBufferDisplay *sys = self;
++    vout_display_t *vd = _vd;
++    vout_display_place_t placeSnapshot = *_vd->place;
+     dispatch_async(dispatch_get_main_queue(), ^{
+         if (sys.displayView)
+             return;
+@@ -730,14 +732,14 @@ - (void)prepareDisplay {
+         VLCView *window = sys.window;
+ 
+         displayView =
+-            [[VLCSampleBufferDisplayView alloc] initWithVoutDisplay:sys.vd];
++            [[VLCSampleBufferDisplayView alloc] initWithVoutDisplay:vd];
+         spuView = [VLCSampleBufferSubpictureView new];
+         [window addSubview:displayView];
+         [window addSubview:spuView];
+         [displayView setFrame:[window bounds]];
+         [spuView setFrame:[window bounds]];
+ 
+-        sys->place = *sys.vd->place;
++        sys->place = placeSnapshot;
+ 
+         sys.displayView = displayView;
+         sys.spuView = spuView;
+-- 
+2.54.0 (Apple Git-157)
+
