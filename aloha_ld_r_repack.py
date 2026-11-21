@@ -191,6 +191,9 @@ KNOWN_DUPLICATE_DROPS = {
     "half2float__cidup1.o",
 }
 
+# libSystem exports clock_gettime/clock_getres; a copy in this archive binds every caller in the consumer's image.
+LIBSYSTEM_SHADOW_DROPS = {"clock_gettime.o", "clock_getres.o", "compat_clock_gettime.c.o"}
+
 # Members that are not real .o files (BSD ar's symbol index, empty
 # entries, etc.) — silently skip.
 ARCHIVE_METADATA_NAMES = {"__.SYMDEF", "__.SYMDEF SORTED", ""}
@@ -336,15 +339,17 @@ def select_for_relink(out_dir: str, filenames: list[str]) -> tuple[list[str], li
 
     Also drops members in KNOWN_DUPLICATE_DROPS from both sets — those
     cause duplicate-symbol errors at `ld -r` time when paired with
-    their libtool-prefixed siblings.
+    their libtool-prefixed siblings — and members in
+    LIBSYSTEM_SHADOW_DROPS, whose definitions would shadow libSystem's.
     """
     to_merge = []
     to_keep = []
     for n in filenames:
-        if n in KNOWN_DUPLICATE_DROPS:
+        if n in KNOWN_DUPLICATE_DROPS or n in LIBSYSTEM_SHADOW_DROPS:
             # Skip entirely — the surviving member of each duplicate pair
             # is already in either to_merge or to_keep (we keep the
-            # plugin-prefixed sibling).
+            # plugin-prefixed sibling); a libSystem shadow has no
+            # replacement here, the consumer binds libSystem's symbol.
             continue
         if is_ffmpeg_related(out_dir, n):
             to_merge.append(n)
@@ -457,7 +462,7 @@ def main() -> None:
 
         to_merge, to_keep = select_for_relink(tmp, members)
         dropped = len(members) - len(to_merge) - len(to_keep)
-        print(f"[aloha_ld_r_repack] dropped {dropped} known-dup .o; "
+        print(f"[aloha_ld_r_repack] dropped {dropped} known-dup or libSystem-shadow .o; "
               f"merge={len(to_merge)} (FFmpeg-related), "
               f"keep-as-is={len(to_keep)}")
 
