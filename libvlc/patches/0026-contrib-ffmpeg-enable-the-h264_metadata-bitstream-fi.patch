@@ -1,0 +1,44 @@
+From 9266a226f1543a0bc3d26b964d50fe8214c5c3f8 Mon Sep 17 00:00:00 2001
+From: VLCKit Aloha Release <devnull@alohabrowser.com>
+Date: Fri, 20 Nov 2026 20:10:45 +0200
+Subject: [PATCH 26/27] contrib: ffmpeg: enable the h264_metadata bitstream
+ filter
+
+The Aloha iOS app links VLCKit's bundled FFmpeg as its only libavcodec,
+and its ffmpegkit runs `-bsf:v h264_metadata=level=N` to rewrite the
+level_idc of re-encoded HLS segments. --disable-bsfs leaves only the
+BSFs an enabled muxer/demuxer/decoder selects, so the lookup failed
+with "Bitstream filter not found".
+
+h264_metadata selects cbs_h264; cbs_h2645.o is already built (vvc
+selects cbs_h266), so the new objects are bsf/h264_metadata.o and
+h264_levels.o. Its only dep is const_nan; if that check failed,
+configure would only warn, so check the built archive for
+_ff_h264_metadata_bsf.
+---
+ contrib/src/ffmpeg/rules.mak | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/contrib/src/ffmpeg/rules.mak b/contrib/src/ffmpeg/rules.mak
+index 7ebc37d..b4ffbd6 100644
+--- a/contrib/src/ffmpeg/rules.mak
++++ b/contrib/src/ffmpeg/rules.mak
+@@ -13,6 +13,7 @@ FFMPEG_LAVC_MIN := 57.37.100
+ FFMPEG_BASENAME := $(subst .,_,$(subst \,_,$(subst /,_,$(FFMPEG_HASH))))
+ 
+ # bsf=vp9_superframe is needed to mux VP9 inside webm/mkv
++# bsf=h264_metadata: the Aloha app's ffmpegkit rewrites an H.264 SPS level_idc with it
+ FFMPEGCONF = --prefix="$(PREFIX)" --enable-static --disable-shared \
+ 	--extra-ldflags="$(LDFLAGS)" \
+ 	--cc="$(CC)" \
+@@ -33,6 +34,7 @@ FFMPEGCONF = --prefix="$(PREFIX)" --enable-static --disable-shared \
+ 	--disable-bzlib \
+ 	--disable-libvpx \
+ 	--enable-bsf=vp9_superframe \
++	--enable-bsf=h264_metadata \
+ 	--disable-swresample \
+ 	--disable-iconv \
+ 	--disable-avisynth \
+-- 
+2.54.0 (Apple Git-157)
+
