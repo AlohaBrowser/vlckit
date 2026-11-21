@@ -440,6 +440,21 @@ package_zip() {
             die "FFmpeg visibility invariant violated for $slice."
         fi
         log Info "    FFmpeg symbols: 0 external (+ $hidden_count private external — hidden, won't leak)"
+        # G1-G3: a defined clock_gettime/clock_getres binds every caller in the app image instead of libSystem's;
+        # the app's video normalization runs -bsf:v h264_metadata; dup3/pipe2 exist only on iOS 27+, the app on 16.0+.
+        local gtmp; gtmp=$(mktemp -d)
+        xcrun nm -m -A "$bin" > "$gtmp/all" 2>/dev/null || die "$slice: nm -m -A failed."
+        xcrun nm -m -u "$bin" > "$gtmp/undef" 2>/dev/null || die "$slice: nm -m -u failed."
+        local clk; clk=$(grep -v '(undefined)' "$gtmp/all" | grep -E ' _clock_get(time|res)$' || true)
+        [ -z "$clk" ] || die "$slice defines _clock_gettime/_clock_getres; they would shadow libSystem's in the app image."
+        log Info "    G1: no _clock_gettime/_clock_getres defined"
+        local bsf; bsf=$(grep -v '(undefined)' "$gtmp/all" | grep -E ' _ff_h264_metadata_bsf$' || true)
+        [ -n "$bsf" ] || die "$slice lacks the h264_metadata bitstream filter."
+        log Info "    G2: _ff_h264_metadata_bsf defined"
+        local sdk27; sdk27=$(grep -E ' _(dup3|pipe2)$' "$gtmp/undef" || true)
+        [ -z "$sdk27" ] || die "$slice imports dup3/pipe2, which exist only on iOS 27+."
+        log Info "    G3: no dup3/pipe2 import"
+        rm -rf "$gtmp"
     done
 
     ZIP_NAME="${ARTIFACT_ID}-${VERSION}-${CLASSIFIER}.zip"
