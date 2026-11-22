@@ -256,7 +256,7 @@ do_xcodebuild_archive() {
         MACH_O_TYPE=staticlib \
         BUILD_LIBRARY_FOR_DISTRIBUTION=YES \
         DEFINES_MODULE=YES \
-        IPHONEOS_DEPLOYMENT_TARGET=11.0 \
+        IPHONEOS_DEPLOYMENT_TARGET=16.0 \
         BITCODE_GENERATION_MODE=none \
         ENABLE_BITCODE=NO \
         SKIP_INSTALL=NO
