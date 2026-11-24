@@ -1,0 +1,184 @@
+From e6e39a585948aa95315a902c48ba42e4834c5d25 Mon Sep 17 00:00:00 2001
+From: Sergey Artemenchuk <artes@alohabrowser.com>
+Date: Tue, 24 Nov 2026 14:53:19 +0200
+Subject: [PATCH] vout: apple: give the subpicture a dedicated lock
+
+The vout thread stores the display's subpicture with objc_storeStrong
+at each subtitle change, and main reads it in the RenderSubpicture
+block with no lock. The vout thread also replaced the regions of a
+subpicture main had already been given to draw. Main could load the
+pointer just before the vout thread released the last reference to
+it, or, on the iOS 26.3 simulator, the 0x400000000000bad0 that
+objc_storeStrong leaves in the slot before the new pointer.
+Watched 33 times, drawRect: crashed twice retaining it from regions.
+Upstream master has the same code.
+
+Store a new subpicture for every change and never change a stored
+one. The store and main's read take a lock created in
+-initWithVoutDisplay:, which does not depend on the value it guards.
+Main copies the pointer out under it and draws after releasing it,
+the vout thread keeps the old value until after it unlocks, so no
+draw and no last release runs under the lock, and the vout thread
+never waits for main while it holds it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../apple/VLCSampleBufferDisplay.m            | 70 +++++++++++++------
+ 1 file changed, 49 insertions(+), 21 deletions(-)
+
+diff --git a/modules/video_output/apple/VLCSampleBufferDisplay.m b/modules/video_output/apple/VLCSampleBufferDisplay.m
+index 32368b2..ff08857 100644
+--- a/modules/video_output/apple/VLCSampleBufferDisplay.m
++++ b/modules/video_output/apple/VLCSampleBufferDisplay.m
+@@ -646,6 +646,9 @@ @interface VLCSampleBufferDisplay: NSObject
+     /* Guards displayLayer, stored on main and read on the vout thread.
+      * @synchronized(displayLayer) would take no lock while it is nil */
+     NSObject *displayLayerLock;
++    /* Guards subpicture, stored on the vout thread and read on main. A stored
++     * subpicture is never changed again: each change stores a new one */
++    NSObject *subpictureLock;
+ }
+     @property (nonatomic, readonly, weak) VLCView *window;
+     @property (nonatomic, readonly) vout_display_t *vd;
+@@ -699,6 +702,7 @@ - (instancetype)initWithVoutDisplay:(vout_display_t *)vd
+     _window = window;
+ 
+     displayLayerLock = [NSObject new];
++    subpictureLock = [NSObject new];
+     atomic_init(&_closing, false);
+     _pipcontroller = CreatePipController(vd, (__bridge void *)self);
+ 
+@@ -919,12 +923,10 @@ static CGRect RegionBackingFrame(unsigned display_height,
+ }
+ 
+ static void UpdateSubpictureRegions(vout_display_t *vd,
+-                                    const vlc_render_subpicture *subpicture)
++                                    const vlc_render_subpicture *subpicture,
++                                    VLCSampleBufferSubpicture *target)
+ {
+-    VLCSampleBufferDisplay *sys;
+-    sys = (__bridge VLCSampleBufferDisplay*)vd->sys;
+-
+-    if (sys.subpicture == nil || subpicture == NULL)
++    if (target == nil || subpicture == NULL)
+         return;
+ 
+     NSMutableArray *regions = [NSMutableArray new];
+@@ -949,7 +951,7 @@ static void UpdateSubpictureRegions(vout_display_t *vd,
+             );
+         VLCSampleBufferSubpictureRegion *region;
+         region = [VLCSampleBufferSubpictureRegion new];
+-        region.subpicture = sys.subpicture;
++        region.subpicture = target;
+         region.image = image;
+         region.alpha = r->i_alpha / 255.f;
+ 
+@@ -960,19 +962,44 @@ static void UpdateSubpictureRegions(vout_display_t *vd,
+     }
+     CGColorSpaceRelease(space);
+ 
+-    sys.subpicture.regions = regions;
++    target.regions = regions;
++}
++
++static void PublishSubpicture(vout_display_t *vd,
++                              const vlc_render_subpicture *subpicture)
++{
++    VLCSampleBufferDisplay *sys;
++    sys = (__bridge VLCSampleBufferDisplay*)vd->sys;
++
++    VLCSampleBufferSubpicture *fresh = nil;
++    if (subpicture != NULL)
++    {
++        fresh = [VLCSampleBufferSubpicture new];
++        fresh.sys = sys;
++        fresh.order = subpicture->i_order;
++        UpdateSubpictureRegions(vd, subpicture, fresh);
++    }
++
++    /* Main waits for subpictureLock: store the pointer and nothing else */
++    @synchronized(sys->subpictureLock) {
++        sys.subpicture = fresh;
++    }
+ }
+ 
+ static bool IsSubpictureDrawNeeded(vout_display_t *vd, const vlc_render_subpicture *subpicture)
+ {
+     VLCSampleBufferDisplay *sys;
+     sys = (__bridge VLCSampleBufferDisplay*)vd->sys;
++    /* Only this thread stores subpicture, so it reads it unlocked; holding
++     * the old value moves its last release out of PublishSubpicture's lock */
++    __attribute__((objc_precise_lifetime))
++    VLCSampleBufferSubpicture *previous = sys.subpicture;
+ 
+     if (subpicture == NULL)
+     {
+-        if (sys.subpicture == nil)
++        if (previous == nil)
+             return false;
+-        sys.subpicture = nil;
++        PublishSubpicture(vd, NULL);
+         /* Need to draw one last time in order to clear the current subpicture */
+         return true;
+     }
+@@ -980,25 +1007,22 @@ static bool IsSubpictureDrawNeeded(vout_display_t *vd, const vlc_render_subpictu
+     size_t count = subpicture->regions.size;
+     const struct subpicture_region_rendered *r;
+ 
+-    if (!sys.subpicture || subpicture->i_order != sys.subpicture.order)
++    if (!previous || subpicture->i_order != previous.order)
+     {
+         /* Subpicture content is different */
+-        sys.subpicture = [VLCSampleBufferSubpicture new];
+-        sys.subpicture.sys = sys;
+-        sys.subpicture.order = subpicture->i_order;
+-        UpdateSubpictureRegions(vd, subpicture);
++        PublishSubpicture(vd, subpicture);
+         return true;
+     }
+ 
+     bool draw = false;
+ 
+-    if (count == sys.subpicture.regions.count)
++    if (count == previous.regions.count)
+     {
+         size_t i = 0;
+         vlc_vector_foreach(r, &subpicture->regions)
+         {
+             VLCSampleBufferSubpictureRegion *region =
+-                sys.subpicture.regions[i++];
++                previous.regions[i++];
+ 
+             CGRect newRegion = RegionBackingFrame(vd->cfg->display.height, r);
+ 
+@@ -1019,10 +1043,9 @@ static bool IsSubpictureDrawNeeded(vout_display_t *vd, const vlc_render_subpictu
+     if (!draw)
+         return false;
+ 
+-    /* Store the current subpicture regions in order to compare then later.
+-     */
+-
+-    UpdateSubpictureRegions(vd, subpicture);
++    /* Main may be drawing the stored subpicture, so store a new one; its
++     * regions are what the next change is compared with */
++    PublishSubpicture(vd, subpicture);
+     return true;
+ }
+ 
+@@ -1035,7 +1058,12 @@ static void RenderSubpicture(vout_display_t *vd, const vlc_render_subpicture *sp
+     sys = (__bridge VLCSampleBufferDisplay*)vd->sys;
+ 
+     dispatch_async(dispatch_get_main_queue(), ^{
+-        [sys.spuView drawSubpicture:sys.subpicture];
++        /* Copy out under the lock: main draws after releasing it */
++        VLCSampleBufferSubpicture *subpicture;
++        @synchronized(sys->subpictureLock) {
++            subpicture = sys.subpicture;
++        }
++        [sys.spuView drawSubpicture:subpicture];
+     });
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+
