@@ -1,0 +1,102 @@
+From 9332bff028f600313f9cd40e2331e91a907163f4 Mon Sep 17 00:00:00 2001
+From: Sergey Artemenchuk <artes@alohabrowser.com>
+Date: Tue, 24 Nov 2026 06:34:08 +0200
+Subject: [PATCH] vout: apple: give the display layer a dedicated lock
+
+The sample buffer display synchronized its displayLayer accesses on the
+displayLayer value itself. @synchronized reads that value before it
+takes any lock, and @synchronized(nil) takes none. The prepareDisplay
+block stores the layer on main while displayLayer is still nil, so that
+store was not serialized with the vout thread, which reads the same
+ivar in -prepareDisplay and in RenderPicture to pick its own lock.
+
+The vout thread can therefore load the ivar while main is inside
+objc_storeStrong. On the iOS 26.3 simulator, a write watchpoint on the
+ivar shows objc_storeStrong leaving 0x400000000000bad0 in it before the
+new pointer; a vout thread that loads it then crashes in objc_retain
+under -[VLCSampleBufferDisplay prepareDisplay] or Prepare, at that
+address. Upstream master locks the same way.
+
+Lock on an object created in -initWithVoutDisplay: instead, at all four
+sites, and read or write displayLayer only under it. Main can now wait
+for that lock, so each critical section is one load or store of the
+ivar: the block gets the layer from its view before locking, and
+RenderPicture takes a reference under the lock and enqueues the sample
+buffer after releasing it. The vout thread never waits for main while
+it holds the lock.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../apple/VLCSampleBufferDisplay.m            | 20 +++++++++++++------
+ 1 file changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/modules/video_output/apple/VLCSampleBufferDisplay.m b/modules/video_output/apple/VLCSampleBufferDisplay.m
+index 4ee2f19..32368b2 100644
+--- a/modules/video_output/apple/VLCSampleBufferDisplay.m
++++ b/modules/video_output/apple/VLCSampleBufferDisplay.m
+@@ -643,6 +643,9 @@ @interface VLCSampleBufferDisplay: NSObject
+     @public
+     vout_display_place_t place;
+     filter_t *converter;
++    /* Guards displayLayer, stored on main and read on the vout thread.
++     * @synchronized(displayLayer) would take no lock while it is nil */
++    NSObject *displayLayerLock;
+ }
+     @property (nonatomic, readonly, weak) VLCView *window;
+     @property (nonatomic, readonly) vout_display_t *vd;
+@@ -695,6 +698,7 @@ - (instancetype)initWithVoutDisplay:(vout_display_t *)vd
+ 
+     _window = window;
+ 
++    displayLayerLock = [NSObject new];
+     atomic_init(&_closing, false);
+     _pipcontroller = CreatePipController(vd, (__bridge void *)self);
+ 
+@@ -717,7 +721,7 @@ - (void)preparePictureInPicture {
+ }
+ 
+ - (void)prepareDisplay {
+-    @synchronized(_displayLayer) {
++    @synchronized(displayLayerLock) {
+         if (_displayLayer)
+             return;
+     }
+@@ -743,8 +747,9 @@ - (void)prepareDisplay {
+ 
+         sys.displayView = displayView;
+         sys.spuView = spuView;
+-        @synchronized(sys.displayLayer) {
+-            sys.displayLayer = displayView.displayLayer;
++        AVSampleBufferDisplayLayer *displayLayer = displayView.displayLayer;
++        @synchronized(sys->displayLayerLock) {
++            sys.displayLayer = displayLayer;
+         }
+         [sys preparePictureInPicture];
+     });
+@@ -818,7 +823,7 @@ static void RenderPicture(vout_display_t *vd, picture_t *pic, vlc_tick_t date) {
+         break;
+     }
+ 
+-    @synchronized(sys.displayLayer) {
++    @synchronized(sys->displayLayerLock) {
+         if (sys.displayLayer == nil)
+             return;
+     }
+@@ -889,9 +894,12 @@ static void RenderPicture(vout_display_t *vd, picture_t *pic, vlc_tick_t date) {
+         return;
+     }
+ 
+-    @synchronized(sys.displayLayer) {
+-        [sys.displayLayer enqueueSampleBuffer:sampleBuffer];
++    /* Main waits for displayLayerLock: never call AVFoundation under it */
++    AVSampleBufferDisplayLayer *displayLayer;
++    @synchronized(sys->displayLayerLock) {
++        displayLayer = sys.displayLayer;
+     }
++    [displayLayer enqueueSampleBuffer:sampleBuffer];
+ 
+     CFRelease(sampleBuffer);
+ }
+-- 
+2.54.0 (Apple Git-157)
+
