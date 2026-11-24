@@ -1,0 +1,247 @@
+From 624502f333a0b9f391630501bfb21e18253e3982 Mon Sep 17 00:00:00 2001
+From: Sergey Artemenchuk <artes@alohabrowser.com>
+Date: Mon, 23 Nov 2026 10:24:59 +0200
+Subject: [PATCH] vout: apple: delete the PiP controller on the main thread
+
+-[VLCSampleBufferDisplay close] runs on the thread that stops the
+display (the input or decoder thread, after the vout thread is joined)
+and deleted the PiP controller there, without a lock. The main-queue
+block that the last Prepare queued can still be in
+-preparePictureInPicture and -[VLCPictureInPictureController prepare:],
+which use that controller: msg_Err() when PiP is unsupported (the
+simulator; SIGSEGV in vlc_object_Log reading the freed object's priv),
+and on devices media_cbs and the msg_Dbg() of the KVO initial callout
+under addObserver:. Upstream master has the same code.
+
+Every prepareDisplay block is queued before Close, so the block that
+-close already queues on the serial main queue runs after all of them:
+delete the controller there. A display that started closing no longer
+prepares PiP.
+
+The PiP controller's close now runs on main before the vlc object is
+freed. It clears its pointer to that object and to the media callbacks,
+and tears the AVKit controller down inline instead of in a later block,
+which ran after the free. The playback delegate methods use a copy of
+OpenController's static callback table, read atomically, and return
+defaults once closed; skipByInterval still calls its completion
+handler. The isPictureInPicturePossible observer, which only logged, is
+gone: a KVO callout on main can come after the player's libvlc
+instance, and the logger the controller inherited, has been destroyed.
+
+The change adds no wait: two atomics (the flag and the callback copy),
+and the deletion moves into a block that -close already dispatched
+asynchronously.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../apple/VLCPictureInPictureController.m     | 72 +++++++++----------
+ .../apple/VLCSampleBufferDisplay.m            | 16 ++++-
+ 2 files changed, 49 insertions(+), 39 deletions(-)
+
+diff --git a/modules/video_output/apple/VLCPictureInPictureController.m b/modules/video_output/apple/VLCPictureInPictureController.m
+index ff3b7f9..7fdf7fa 100644
+--- a/modules/video_output/apple/VLCPictureInPictureController.m
++++ b/modules/video_output/apple/VLCPictureInPictureController.m
+@@ -29,6 +29,7 @@
+ #include <vlc_common.h>
+ #include <vlc_plugin.h>
+ #include <vlc_modules.h>
++#include <vlc_atomic.h>
+ 
+ #import <TargetConditionals.h>
+ #import <Foundation/Foundation.h>
+@@ -55,12 +56,18 @@ - (void)invalidatePlaybackState;
+ @end
+ 
+ @implementation VLCPictureInPictureController
++{
++    /* OpenController's static table, NULL once closed: an AVKit callout,
++     * on whatever thread, never reads the deleted vlc object */
++    const struct pip_controller_media_callbacks *_Atomic _mediaCallbacks;
++}
+ 
+ - (instancetype)initWithPipController:(pip_controller_t *)pipcontroller {
+     self = [super init];
+     if (!self)
+         return nil;
+     _pipcontroller = pipcontroller;
++    atomic_init(&_mediaCallbacks, pipcontroller->media_cbs);
+ 
+     id drawable = (__bridge id)var_InheritAddress (pipcontroller, "drawable-nsobject");
+     
+@@ -90,7 +97,8 @@ - (void)prepare:(AVSampleBufferDisplayLayer *)layer {
+             initWithContentSource:avPipSource
+     ];
+     void *mediaController = (__bridge void*)_drawable.mediaController;
+-    BOOL isMediaSeekable = (BOOL)_pipcontroller->media_cbs->is_media_seekable(mediaController);
++    const struct pip_controller_media_callbacks *cbs = atomic_load(&_mediaCallbacks);
++    BOOL isMediaSeekable = (BOOL)cbs->is_media_seekable(mediaController);
+     avPipController.requiresLinearPlayback = !isMediaSeekable;
+     avPipController.delegate = self;
+ #if TARGET_OS_IOS
+@@ -106,38 +114,20 @@ - (void)prepare:(AVSampleBufferDisplayLayer *)layer {
+ #endif
+     _avPipController = avPipController;
+ 
+-
+-    [_avPipController addObserver:self
+-                       forKeyPath:@"isPictureInPicturePossible"
+-                          options:NSKeyValueObservingOptionInitial|NSKeyValueObservingOptionNew
+-                          context:NULL];
+-
+     _drawable.pictureInPictureReady(self);
+ }
+ 
+ - (void)close {
++    /* Runs on main, from DeletePipController before the vlc object is freed:
++     * no callout after this may reach that object */
++    _pipcontroller = NULL;
++    atomic_store(&_mediaCallbacks, NULL);
+     AVPictureInPictureController *avPipController =
+         (AVPictureInPictureController *)_avPipController;
+-    NSObject *observer = self;
+-    dispatch_async(dispatch_get_main_queue(),^{
+-        avPipController.contentSource = nil;
+-        [avPipController removeObserver:observer forKeyPath:@"isPictureInPicturePossible"];
+-    });
++    avPipController.contentSource = nil;
+     _avPipController = nil;
+ }
+ 
+-- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
+-                        change:(NSDictionary<NSKeyValueChangeKey,id> *)change
+-                       context:(void *)context {
+-    if (object==_avPipController) {
+-        if ([keyPath isEqualToString:@"isPictureInPicturePossible"]) {
+-            msg_Dbg(_pipcontroller, "isPictureInPicturePossible:%d", [change[NSKeyValueChangeNewKey] boolValue]);
+-        }
+-    } else {
+-        [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+-    }
+-}
+-
+ #pragma mark - AVPictureInPictureSampleBufferPlaybackDelegate
+ 
+ - (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController
+@@ -147,43 +137,53 @@ - (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPict
+ 
+ - (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController
+                         setPlaying:(BOOL)playing {
+-    assert(_pipcontroller->media_cbs);
++    const struct pip_controller_media_callbacks *cbs = atomic_load(&_mediaCallbacks);
++    if (cbs == NULL)
++        return;
+     void *mediaController = (__bridge void*)_drawable.mediaController;
+-    bool isPlaying = _pipcontroller->media_cbs->is_media_playing(mediaController);
++    bool isPlaying = cbs->is_media_playing(mediaController);
+     if(isPlaying && !playing)
+-        _pipcontroller->media_cbs->pause(mediaController);    
++        cbs->pause(mediaController);
+     if(!isPlaying && playing)
+-        _pipcontroller->media_cbs->play(mediaController);
++        cbs->play(mediaController);
+ }
+ 
+ - (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController
+                     skipByInterval:(CMTime)skipInterval
+                  completionHandler:(void (^)(void))completionHandler {
+-    assert(_pipcontroller->media_cbs);
++    const struct pip_controller_media_callbacks *cbs = atomic_load(&_mediaCallbacks);
++    if (cbs == NULL) {
++        completionHandler();
++        return;
++    }
+     Float64 time_sec = CMTimeGetSeconds(skipInterval);
+     
+     void *mediaController = (__bridge void*)_drawable.mediaController;
+     int64_t offset = time_sec * 1e3;
+-    _pipcontroller->media_cbs->seek_by(offset, completionHandler, mediaController);
++    cbs->seek_by(offset, completionHandler, mediaController);
+ }
+ 
+ - (BOOL)pictureInPictureControllerIsPlaybackPaused:(AVPictureInPictureController *)pictureInPictureController {
+-    assert(_pipcontroller->media_cbs);
++    const struct pip_controller_media_callbacks *cbs = atomic_load(&_mediaCallbacks);
++    if (cbs == NULL)
++        return YES;
+     void *mediaController = (__bridge void*)_drawable.mediaController;
+-    return ! _pipcontroller->media_cbs->is_media_playing(mediaController);
++    return ! cbs->is_media_playing(mediaController);
+ }
+ 
+ - (CMTimeRange)pictureInPictureControllerTimeRangeForPlayback:(AVPictureInPictureController *)pictureInPictureController {
+-    assert(_pipcontroller->media_cbs);
++    const struct pip_controller_media_callbacks *cbs = atomic_load(&_mediaCallbacks);
+     //TODO: Handle media duration
+     void *mediaController = (__bridge void*)_drawable.mediaController;
+     const CMTimeRange live = CMTimeRangeMake(kCMTimeNegativeInfinity, kCMTimePositiveInfinity);
+-    
+-    int64_t length = _pipcontroller->media_cbs->media_length(mediaController);
++    if (cbs == NULL)
++        return live;
++
++    int64_t length = cbs->media_length(mediaController);
+     if (length == VLC_TICK_INVALID)
+         return live;
+ 
+-    int64_t time = _pipcontroller->media_cbs->media_time(mediaController);
++    int64_t time = cbs->media_time(mediaController);
+ 
+     CFTimeInterval ca_now = CACurrentMediaTime();
+     CFTimeInterval time_sec = ((Float64)time) * 1e-3;
+diff --git a/modules/video_output/apple/VLCSampleBufferDisplay.m b/modules/video_output/apple/VLCSampleBufferDisplay.m
+index 7c53a84..4ee2f19 100644
+--- a/modules/video_output/apple/VLCSampleBufferDisplay.m
++++ b/modules/video_output/apple/VLCSampleBufferDisplay.m
+@@ -660,6 +660,9 @@ - (instancetype)initWithVoutDisplay:(vout_display_t *)vd;
+ @end
+ 
+ @implementation VLCSampleBufferDisplay
++{
++    atomic_bool _closing;
++}
+ 
+ - (id<VLCPixelBufferRotationContext>)rotationContext
+ {
+@@ -692,6 +695,7 @@ - (instancetype)initWithVoutDisplay:(vout_display_t *)vd
+ 
+     _window = window;
+ 
++    atomic_init(&_closing, false);
+     _pipcontroller = CreatePipController(vd, (__bridge void *)self);
+ 
+     _vd = vd;
+@@ -700,7 +704,8 @@ - (instancetype)initWithVoutDisplay:(vout_display_t *)vd
+ }
+ 
+ - (void)preparePictureInPicture {
+-    if ( !_pipcontroller)
++    /* A display that started closing gets no PiP */
++    if ( !_pipcontroller || atomic_load(&_closing))
+         return;
+ 
+     if ( _pipcontroller->ops->set_display_layer ) {
+@@ -746,13 +751,18 @@ - (void)prepareDisplay {
+ }
+ 
+ - (void)close {
++    atomic_store(&_closing, true);
+     VLCSampleBufferDisplay *sys = self;
++    pip_controller_t *pipcontroller = _pipcontroller;
++    /* The vout thread is joined before Close, so every prepareDisplay block
++     * was queued before this one and may still use the PiP controller:
++     * delete it on main, after them */
+     dispatch_async(dispatch_get_main_queue(), ^{
+         [sys.displayView removeFromSuperview];
+         [sys.spuView removeFromSuperview];
++        sys->_pipcontroller = NULL;
++        DeletePipController(pipcontroller);
+     });
+-    DeletePipController(_pipcontroller);
+-    _pipcontroller = NULL;
+ }
+ 
+ @end
+-- 
+2.54.0 (Apple Git-157)
+
